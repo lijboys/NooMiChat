@@ -1,8 +1,8 @@
 /**
- * RelayGo - 新一代 Telegram 私聊机器人
- * 项目地址: https://github.com/abcxyz-123456/RelayGo
- * 版本: 2.0 (Standalone)
- * 官方频道：https://t.me/RelayGo
+ * NooMiChat - Telegram 双向私聊机器人
+ * 项目地址: https://github.com/lijboys/NooMiChat
+ * 版本: 1.1.23 (Settings Tabs UI)
+ * 说明：基于 RelayGo 开源项目二次开发
  * 当前版本可能仍不稳定，如遇到 BUG 请提交至 issues
  */
 
@@ -10,7 +10,7 @@
 const CENTRAL_API_URL = "https://verify.wzxabc.eu.org";
 const CENTRAL_BOT_USERNAME = "RelayVerifyBot";
 const CENTRAL_WEBAPP_NAME = "verify";
-const FIXED_BRAND_MSG = "🔥 基于 @RelayGo 开源项目构建";
+const DEFAULT_BRAND_MSG = '🔥 项目 <a href="https://github.com/lijboys/NooMiChat">NooMiChat</a>  · 基于 RelayGo 开源项目二次开发，感谢abcxyz-123456的开源';
 const CACHE_TTL_BAN_CHECK = 3600 * 24;     // 全局封禁状态缓存24小时
 
 const CORS_HEADERS = {
@@ -43,11 +43,71 @@ const D1_TABLES_SQL = [
     `CREATE TABLE IF NOT EXISTS blacklist (user_id TEXT PRIMARY KEY, reason TEXT, appeal_url TEXT, card_message_id INTEGER, created_at INTEGER NOT NULL, lifted_at INTEGER)`,
     `CREATE TABLE IF NOT EXISTS inbox_cards (user_id TEXT PRIMARY KEY, message_id INTEGER, thread_id INTEGER, last_message_at INTEGER, updated_at INTEGER NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS profile_cards (user_id TEXT PRIMARY KEY, message_id INTEGER, thread_id INTEGER, updated_at INTEGER NOT NULL)`,
-    `CREATE TABLE IF NOT EXISTS audit_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, actor_id TEXT, action TEXT NOT NULL, target_id TEXT, detail TEXT, created_at INTEGER NOT NULL)`
+    `CREATE TABLE IF NOT EXISTS audit_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, actor_id TEXT, action TEXT NOT NULL, target_id TEXT, detail TEXT, created_at INTEGER NOT NULL)`,
+    `CREATE TABLE IF NOT EXISTS kv_store (key TEXT PRIMARY KEY, value TEXT, expires_at INTEGER, updated_at INTEGER NOT NULL)`,
 ];
 const ALL_PERMISSIONS = ['reply', 'panel', 'ban', 'config'];
 
-function getD1(env) { return env.DB || env.D1 || env.DATABASE || env.RELAYGO_DB || null; }
+function isD1Database(db) {
+    return !!db && typeof db.prepare === 'function';
+}
+function getD1(env) {
+    return env.DB || env.D1 || env.DATABASE || env.NOOMICHAT_DB || env.RELAYGO_DB || (isD1Database(env.KV) ? env.KV : null) || null;
+}
+function createD1KVCompat(db) {
+    let ready = false;
+    async function ensureStore() {
+        if (ready) return;
+        await db.prepare('CREATE TABLE IF NOT EXISTS kv_store (key TEXT PRIMARY KEY, value TEXT, expires_at INTEGER, updated_at INTEGER NOT NULL)').run();
+        ready = true;
+    }
+    async function cleanupExpired(key) {
+        const now = Date.now();
+        if (key) await db.prepare('DELETE FROM kv_store WHERE key = ? AND expires_at IS NOT NULL AND expires_at <= ?').bind(String(key), now).run();
+        else await db.prepare('DELETE FROM kv_store WHERE expires_at IS NOT NULL AND expires_at <= ?').bind(now).run();
+    }
+    return {
+        async get(key, options = {}) {
+            await ensureStore();
+            await cleanupExpired(key);
+            const row = await db.prepare('SELECT value FROM kv_store WHERE key = ?').bind(String(key)).first();
+            if (!row) return null;
+            if (options && options.type === 'json') {
+                try { return JSON.parse(row.value); } catch (e) { return null; }
+            }
+            return row.value;
+        },
+        async put(key, value, options = {}) {
+            await ensureStore();
+            const now = Date.now();
+            let expiresAt = null;
+            if (options && options.expirationTtl) expiresAt = now + Number(options.expirationTtl) * 1000;
+            if (options && options.expiration) expiresAt = Number(options.expiration) * 1000;
+            const storedValue = typeof value === 'string' ? value : JSON.stringify(value);
+            await db.prepare('INSERT INTO kv_store (key, value, expires_at, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, expires_at = excluded.expires_at, updated_at = excluded.updated_at')
+                .bind(String(key), storedValue, expiresAt, now).run();
+        },
+        async delete(key) {
+            await ensureStore();
+            await db.prepare('DELETE FROM kv_store WHERE key = ?').bind(String(key)).run();
+        },
+        async list(options = {}) {
+            await ensureStore();
+            await cleanupExpired();
+            const prefix = String((options && options.prefix) || '');
+            const limit = Math.min(Math.max(Number(options && options.limit) || 1000, 1), 1000);
+            const offset = Math.max(parseInt((options && options.cursor) || '0', 10) || 0, 0);
+            const result = await db.prepare('SELECT key FROM kv_store WHERE key LIKE ? ORDER BY key LIMIT ? OFFSET ?').bind(`${prefix}%`, limit + 1, offset).all();
+            const rows = result.results || [];
+            const hasMore = rows.length > limit;
+            return {
+                keys: rows.slice(0, limit).map(row => ({ name: row.key })),
+                list_complete: !hasMore,
+                cursor: hasMore ? String(offset + limit) : undefined
+            };
+        }
+    };
+}
 async function ensureD1Schema(env) {
     const db = getD1(env);
     if (!db || memGet('__d1_schema_ready')) return !!db;
@@ -233,6 +293,59 @@ function escapeHtml(unsafe) {
 const jsonResponse = (data, status = 200) => new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json', ...CORS_HEADERS } });
 const errorResponse = (msg, status = 500) => jsonResponse({ error: msg }, status);
 
+function isKVNamespace(kv) {
+    return !!kv && typeof kv.get === 'function' && typeof kv.put === 'function' && typeof kv.delete === 'function';
+}
+function describeKVBinding(env) {
+    const kv = env && env.KV;
+    const type = kv === null ? 'null' : Array.isArray(kv) ? 'array' : typeof kv;
+    let keys = [];
+    try { if (kv && (type === 'object' || type === 'function')) keys = Object.keys(kv).slice(0, 20); } catch (e) { keys = ['<uninspectable>']; }
+    return {
+        present: !!kv,
+        valid: isKVNamespace(kv),
+        invalid: !!(env && env.__KV_BINDING_INVALID),
+        type,
+        keys,
+        methods: {
+            get: typeof (kv && kv.get),
+            put: typeof (kv && kv.put),
+            delete: typeof (kv && kv.delete),
+            list: typeof (kv && kv.list)
+        },
+        d1_compat: !!(env && env.__KV_D1_COMPAT)
+    };
+}
+
+function normalizeEnv(env) {
+    if (!env) return env;
+    if (isKVNamespace(env.KV)) return env;
+    const db = getD1(env);
+    if (db) {
+        return { ...env, DB: env.DB || db, KV: createD1KVCompat(db), __KV_D1_COMPAT: true, __KV_BINDING_INVALID: !!env.KV && !isD1Database(env.KV) };
+    }
+    if (env.KV && !isKVNamespace(env.KV)) {
+        return { ...env, KV: null, __KV_BINDING_INVALID: true };
+    }
+    return env;
+}
+
+function getRuntimeProblems(env) {
+    const problems = [];
+    if (!env.BOT_TOKEN) problems.push('Missing BOT_TOKEN secret');
+    if (!env.OWNER_ID) problems.push('Missing OWNER_ID variable');
+    if (!getD1(env) && !isKVNamespace(env.KV)) problems.push('Missing D1 binding DB or KV binding KV');
+    if (env.__KV_BINDING_INVALID && !env.__KV_D1_COMPAT) problems.push('Binding named KV is not a KV Namespace');
+    return problems;
+}
+
+function assertWebhookReady(env) {
+    const problems = getRuntimeProblems(env);
+    if (problems.length) {
+        throw new Error(`Worker is not ready: ${problems.join('; ')}`);
+    }
+}
+
 async function tgRequest(token, method, payload) {
     const url = `https://api.telegram.org/bot${token}/${method}`;
     try {
@@ -319,17 +432,29 @@ function parseButtons(input) {
 }
 
 // 发送欢迎消息
-async function sendWelcomeMessage(env, userId) {
+async function sendWelcomeMessage(env, userId, options = {}) {
     const welcomeMsg = await getConfig(env, 'welcome_msg', "👋 欢迎使用本机器人！");
+    const brandMsg = options.includeBrand ? await getConfig(env, 'brand_msg', DEFAULT_BRAND_MSG) : '';
     let welcomeText = welcomeMsg;
-    welcomeText += `\n\n${FIXED_BRAND_MSG}`;
+    if (brandMsg) welcomeText += `\n\n${brandMsg}`;
 
-    const payload = { chat_id: userId, text: welcomeText, disable_web_page_preview: true };
+    const payload = { chat_id: userId, text: welcomeText, parse_mode: 'HTML', disable_web_page_preview: true };
     const buttonsJson = await getConfig(env, 'welcome_buttons');
     if (buttonsJson) {
         try { payload.reply_markup = { inline_keyboard: JSON.parse(buttonsJson) }; } catch (e) { }
     }
-    await tgRequest(env.BOT_TOKEN, 'sendMessage', payload);
+    const sent = await tgRequest(env.BOT_TOKEN, 'sendMessage', payload);
+    if (!sent.ok && String(sent.description || '').includes("can't parse")) {
+        delete payload.parse_mode;
+        payload.text = welcomeText.replace(/<[^>]+>/g, '');
+        await tgRequest(env.BOT_TOKEN, 'sendMessage', payload);
+    }
+}
+async function sendAlreadyVerifiedMessage(env, userId) {
+    return tgRequest(env.BOT_TOKEN, 'sendMessage', {
+        chat_id: userId,
+        text: '✅ 您已通过验证，请直接发送要咨询的消息。'
+    });
 }
 
 function htmlResponse(html, status = 200) {
@@ -377,8 +502,6 @@ async function setWebhookToCurrentWorker(env, request) {
 }
 
 async function getWebAdminState(env, request) {
-    const webhook = await tgRequest(env.BOT_TOKEN, 'getWebhookInfo', {});
-    const menu = await generateSettingsMenu(env);
     const admins = await listAdmins(env);
     const verifyQuestionMode = await getConfig(env, 'verify_question_mode', await getConfig(env, 'verify_mode', 'off'));
     const settings = {
@@ -392,43 +515,579 @@ async function getWebAdminState(env, request) {
         verify_question_mode: verifyQuestionMode,
         verify_combo_mode: await getConfig(env, 'verify_combo_mode', 'question_only'),
         verify_fail_limit: await getConfig(env, 'verify_fail_limit', '2'),
-        appeal_url: await getAppealUrl(env),
+        verify_inactive_hours: await getConfig(env, 'verify_inactive_hours', ''),
+        verify_inactive_days: await getConfig(env, 'verify_inactive_days', '0'),
+        verify_image_api_url: await getConfig(env, 'verify_image_api_url', ''),
+        appeal_url: await getLocalAppealUrl(env),
+        local_appeal_url: await getLocalAppealUrl(env),
+        union_appeal_url: await getUnionAppealUrl(env),
         welcome_msg: await getConfig(env, 'welcome_msg', ''),
+        brand_msg: await getConfig(env, 'brand_msg', DEFAULT_BRAND_MSG),
+        welcome_buttons_text: await getConfig(env, 'welcome_buttons_text', ''),
         auto_reply_msg: await getConfig(env, 'auto_reply_msg', ''),
         business_rest_message: await getConfig(env, 'business_rest_message', '⏸ 当前为休息中，管理员稍后会回复您。'),
         business_rest_cooldown: await getConfig(env, 'business_rest_cooldown', '600')
     };
-    return { ok: true, status: 'running', version: '1.1.6 (Standalone)', settings, admins, telegram_webhook: webhook, telegram_panel: menu.text };
+    const problems = getRuntimeProblems(env);
+    return { ok: true, status: problems.length ? 'not_ready' : 'running', version: '1.1.23 (Settings Tabs UI)', settings, admins, runtime: { problems, kv: describeKVBinding(env), d1: !!getD1(env), bot_token: !!env.BOT_TOKEN, owner_id: !!env.OWNER_ID } };
 }
 
 async function handleWebAdminApi(request, env) {
     if (!requireWebAdmin(request, env)) return errorResponse('Unauthorized', 401);
     const url = new URL(request.url);
     if (url.pathname === '/api/status') return jsonResponse(await getWebAdminState(env, request));
+    if (url.pathname === '/api/diagnostics') return jsonResponse(await getDiagnostics(env, request));
     if (url.pathname === '/api/webhook/set' && request.method === 'POST') return jsonResponse(await setWebhookToCurrentWorker(env, request));
     if (url.pathname === '/api/commands/set' && request.method === 'POST') return jsonResponse(await setupBotCommands(env));
+    if (url.pathname === '/api/blacklist' && request.method === 'GET') {
+        return jsonResponse({ ok: true, items: await listBlacklist(env, url.searchParams.get('user_id') || '') });
+    }
+    if (url.pathname === '/api/blacklist/ban' && request.method === 'POST') {
+        const body = await request.json();
+        const userId = String(body.user_id || '').trim();
+        const reason = String(body.reason || '后台手动封禁').trim();
+        if (!userId) return errorResponse('Missing user_id', 400);
+        await banUserWithNotice(env, userId, reason);
+        await writeAuditLog(env, 'web_admin', 'user.ban', userId, { source: 'web_blacklist', reason });
+        return jsonResponse({ ok: true, items: await listBlacklist(env, userId) });
+    }
+    if (url.pathname === '/api/blacklist/unban' && request.method === 'POST') {
+        const body = await request.json();
+        const userId = String(body.user_id || '').trim();
+        if (!userId) return errorResponse('Missing user_id', 400);
+        await unbanUser(env, userId);
+        await writeAuditLog(env, 'web_admin', 'user.unban', userId, { source: 'web_blacklist' });
+        return jsonResponse({ ok: true, items: await listBlacklist(env, userId) });
+    }
+    if (url.pathname === '/api/admins' && request.method === 'POST') {
+        const body = await request.json();
+        const userId = String(body.user_id || '').trim();
+        if (!userId) return errorResponse('Missing user_id', 400);
+        const rawPerms = Array.isArray(body.permissions) ? body.permissions : String(body.permissions || 'reply,panel').split(/[\s,，]+/);
+        const permissions = rawPerms.map(p => String(p).trim()).filter(Boolean);
+        await addAdmin(env, userId, permissions);
+        await writeAuditLog(env, 'web_admin', 'admin.upsert', userId, { permissions });
+        return jsonResponse({ ok: true, state: await getWebAdminState(env, request) });
+    }
+    if (url.pathname === '/api/admins/delete' && request.method === 'POST') {
+        const body = await request.json();
+        const userId = String(body.user_id || '').trim();
+        if (!userId) return errorResponse('Missing user_id', 400);
+        await removeAdmin(env, userId);
+        await writeAuditLog(env, 'web_admin', 'admin.delete', userId);
+        return jsonResponse({ ok: true, state: await getWebAdminState(env, request) });
+    }
     if (url.pathname === '/api/config' && request.method === 'POST') {
         const body = await request.json();
-        const allowed = new Set(['business_status', 'business_rest_message', 'business_rest_cooldown', 'ai_translate', 'union_ban', 'verify_captcha_mode', 'verify_question_mode', 'verify_combo_mode', 'verify_fail_limit', 'appeal_url', 'welcome_msg', 'auto_reply_msg']);
+        const allowed = new Set(['business_status', 'business_rest_message', 'business_rest_cooldown', 'ai_translate', 'union_ban', 'verify_captcha_mode', 'verify_question_mode', 'verify_combo_mode', 'verify_fail_limit', 'verify_inactive_hours', 'verify_inactive_days', 'verify_image_api_url', 'appeal_url', 'local_appeal_url', 'union_appeal_url', 'welcome_msg', 'brand_msg', 'welcome_buttons_text', 'auto_reply_msg']);
         const keys = [];
         for (const [key, value] of Object.entries(body || {})) {
             if (allowed.has(key)) {
                 await setConfig(env, key, value);
+                if (key === 'welcome_buttons_text') {
+                    const buttons = parseButtons(value);
+                    if (buttons) await setConfig(env, 'welcome_buttons', JSON.stringify(buttons));
+                    else await deleteConfig(env, 'welcome_buttons');
+                }
                 keys.push(key);
             }
         }
+        if (body.local_appeal_url !== undefined && body.appeal_url === undefined) await setConfig(env, 'appeal_url', body.local_appeal_url);
         await writeAuditLog(env, 'web_admin', 'config.update', '', { keys });
-        return jsonResponse({ ok: true, state: await getWebAdminState(env, request) });
+        return jsonResponse({ ok: true, keys });
     }
     return errorResponse('Not found', 404);
 }
 
-function renderWebAdminPage() {
-    return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>RelayGo 后台</title><style>:root{color-scheme:dark light;font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0f172a;color:#e5e7eb}body{margin:0;background:radial-gradient(circle at top,#1d4ed8 0,#0f172a 36rem);min-height:100vh}.wrap{max-width:1120px;margin:0 auto;padding:32px 18px 56px}.hero{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;margin-bottom:22px}.card{background:rgba(15,23,42,.78);border:1px solid rgba(148,163,184,.25);border-radius:18px;padding:18px;box-shadow:0 20px 60px rgba(0,0,0,.28);backdrop-filter:blur(16px)}h1{margin:0 0 8px;font-size:32px}.muted{color:#94a3b8}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.full{grid-column:1/-1}label{display:block;margin:12px 0 6px;color:#cbd5e1;font-size:14px}input,select,textarea{box-sizing:border-box;width:100%;border:1px solid rgba(148,163,184,.35);background:#020617;color:#e5e7eb;border-radius:12px;padding:11px 12px;font:inherit}textarea{min-height:86px;resize:vertical}button{border:0;border-radius:12px;padding:11px 14px;background:#2563eb;color:white;font-weight:700;cursor:pointer;margin:6px 8px 6px 0}button.secondary{background:#334155}button.good{background:#16a34a}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.pill{display:inline-flex;padding:5px 9px;border-radius:999px;background:#1e293b;border:1px solid rgba(148,163,184,.25);font-size:12px}.ok{color:#86efac}.bad{color:#fca5a5}pre{white-space:pre-wrap;word-break:break-word;background:#020617;border-radius:12px;padding:12px;max-height:280px;overflow:auto}.toast{position:fixed;right:18px;bottom:18px;background:#111827;border:1px solid #334155;border-radius:14px;padding:12px 14px;display:none}@media(max-width:760px){.grid{grid-template-columns:1fr}.hero{display:block}}</style></head><body><div class="wrap"><div class="hero"><div><h1>RelayGo 后台</h1><div class="muted">网页管理、Webhook 一键配置、基础开关设置</div></div><div class="card"><div class="muted">认证密钥</div><input id="adminKey" type="password" placeholder="ADMIN_KEY / OWNER_ID"><button onclick="saveKey()">保存并刷新</button></div></div><div class="grid"><section class="card"><h2>部署状态</h2><div id="status" class="muted">等待加载...</div><div class="row"><button class="good" onclick="setWebhook()">一键设置 Webhook + 菜单</button><button class="secondary" onclick="setCommands()">只设置 TG 菜单</button><button class="secondary" onclick="loadState()">刷新状态</button></div><pre id="webhookInfo"></pre></section><section class="card"><h2>快捷入口</h2><p class="muted">如果按钮无效，先确认 Webhook 指向当前 Worker。</p><div class="row"><a id="openWebhook" target="_blank"><button class="secondary">打开 Webhook 地址</button></a></div><pre id="workerInfo"></pre></section><section class="card"><h2>运行开关</h2><label>营业状态</label><select id="business_status"><option value="open">营业中</option><option value="rest">休息中</option></select><label>休息提示</label><textarea id="business_rest_message"></textarea><label>休息冷却秒数</label><input id="business_rest_cooldown" type="number" min="60"><label>AI 翻译</label><select id="ai_translate"><option value="0">关闭</option><option value="1">开启</option></select><label>联盟封禁</label><select id="union_ban"><option value="0">关闭</option><option value="1">开启</option></select><button onclick="saveConfig()">保存开关</button></section><section class="card"><h2>验证系统</h2><label>验证码模式</label><select id="verify_captcha_mode"><option value="off">关闭</option><option value="cloudflare_turnstile">Cloudflare Turnstile</option><option value="google_recaptcha">Google reCAPTCHA</option></select><label>问答模式</label><select id="verify_question_mode"><option value="off">关闭</option><option value="math">数学题</option><option value="button_math">算术按钮</option><option value="image_digit">图片数字</option><option value="custom_question">自定义问答</option></select><label>组合模式</label><select id="verify_combo_mode"><option value="captcha_only">只验证码</option><option value="question_only">只问答</option><option value="captcha_question">验证码 + 问答</option></select><label>失败封禁次数</label><input id="verify_fail_limit" type="number" min="1" max="9"><label>申诉链接</label><input id="appeal_url"><button onclick="saveConfig()">保存验证</button></section><section class="card full"><h2>消息配置</h2><label>欢迎语</label><textarea id="welcome_msg"></textarea><label>自动回复</label><textarea id="auto_reply_msg"></textarea><button onclick="saveConfig()">保存消息配置</button></section><section class="card full"><h2>协管列表</h2><pre id="admins"></pre><p class="muted">添加/删除协管暂时仍建议在 Telegram 私聊发送 /addadmin 和 /deladmin，避免网页误操作。</p></section></div></div><div id="toast" class="toast"></div><script>let state=null;const $=id=>document.getElementById(id);$('adminKey').value=localStorage.getItem('relaygo_admin_key')||'';function toast(msg){const el=$('toast');el.textContent=msg;el.style.display='block';setTimeout(()=>el.style.display='none',2600)}function saveKey(){localStorage.setItem('relaygo_admin_key',$('adminKey').value.trim());loadState()}async function api(path,opt={}){const key=$('adminKey').value.trim();const res=await fetch(path,{...opt,headers:{'content-type':'application/json','x-admin-key':key,...(opt.headers||{})}});const data=await res.json().catch(()=>({error:'Invalid JSON'}));if(!res.ok)throw new Error(data.error||res.statusText);return data}function fill(s){state=s;const cfg=s.settings;$('status').innerHTML='<span class="pill ok">Worker running</span> '+(s.version||'');$('workerInfo').textContent='Worker: '+cfg.worker_url+'\nWebhook: '+cfg.webhook_url+'\nGroup ID: '+(cfg.group_id||'未绑定');$('webhookInfo').textContent=JSON.stringify(s.telegram_webhook,null,2);$('openWebhook').href=cfg.webhook_url;for(const k of Object.keys(cfg)){if($(k))$(k).value=cfg[k]??''}$('admins').textContent=(s.admins||[]).map(a=>a.user_id+' ['+(a.is_owner?'OWNER':'ADMIN')+'] '+a.permissions.join(',')).join('\n')||'暂无协管'}async function loadState(){try{fill(await api('/api/status'));toast('已刷新')}catch(e){$('status').innerHTML='<span class="bad">'+e.message+'</span>';toast(e.message)}}async function setWebhook(){try{const r=await api('/api/webhook/set',{method:'POST',body:'{}'});toast(r.telegram&&r.telegram.ok?'Webhook 已设置':'设置失败');loadState()}catch(e){toast(e.message)}}async function setCommands(){try{const r=await api('/api/commands/set',{method:'POST',body:'{}'});toast(r.ok?'菜单已设置':'设置失败')}catch(e){toast(e.message)}}async function saveConfig(){const keys=['business_status','business_rest_message','business_rest_cooldown','ai_translate','union_ban','verify_captcha_mode','verify_question_mode','verify_combo_mode','verify_fail_limit','appeal_url','welcome_msg','auto_reply_msg'];const body={};for(const k of keys)body[k]=$(k).value;try{const r=await api('/api/config',{method:'POST',body:JSON.stringify(body)});fill(r.state);toast('配置已保存')}catch(e){toast(e.message)}}if($('adminKey').value)loadState();else $('status').textContent='请输入 ADMIN_KEY 后加载。';</script></body></html>`;
+async function getDiagnostics(env, request) {
+    const problems = getRuntimeProblems(env);
+    const verifySettings = await getVerifySettings(env);
+    const unionBanEnabled = await getUnionBanEnabled(env);
+    const checks = {
+        worker_url: getBaseUrl(request),
+        webhook_url: `${getBaseUrl(request)}/webhook`,
+        ready: problems.length === 0,
+        problems,
+        has_bot_token: !!env.BOT_TOKEN,
+        has_owner_id: !!env.OWNER_ID,
+        has_admin_key: !!(env.ADMIN_KEY || env.ADMIN_PASSWORD),
+        has_kv: isKVNamespace(env.KV),
+        kv_binding_invalid: !!env.__KV_BINDING_INVALID,
+        kv_detail: describeKVBinding(env),
+        has_d1: !!getD1(env),
+        has_ai: !!env.AI,
+        verify_effective: {
+            union_ban: unionBanEnabled,
+            captcha_mode: verifySettings.captchaMode,
+            question_mode: verifySettings.questionMode,
+            combo_mode: verifySettings.comboMode,
+            should_run_captcha: shouldRunCaptcha(verifySettings, unionBanEnabled),
+            should_run_question: shouldRunQuestion(verifySettings),
+            trigger_reason: getVerifyTriggerReason(verifySettings, unionBanEnabled)
+        },
+        d1_schema_ok: false,
+        kv_ok: false,
+        bot_ok: false,
+        bot_username: '',
+        webhook: null
+    };
+    try { checks.d1_schema_ok = await ensureD1Schema(env); } catch (e) { checks.d1_error = e.message; }
+    try { if (isKVNamespace(env.KV)) { await env.KV.put('__noomichat_diag', String(Date.now()), { expirationTtl: 60 }); checks.kv_ok = true; } } catch (e) { checks.kv_error = e.message; }
+    try {
+        if (env.BOT_TOKEN) {
+            const me = await tgRequest(env.BOT_TOKEN, 'getMe', {});
+            checks.bot_ok = !!me.ok;
+            checks.bot_username = me.ok && me.result ? me.result.username : '';
+            checks.bot_error = me.ok ? '' : me.description;
+            checks.webhook = await tgRequest(env.BOT_TOKEN, 'getWebhookInfo', {});
+        }
+    } catch (e) { checks.bot_error = e.message; }
+    return { ok: true, checks };
 }
-// 主入口
+
+function renderWebAdminPage() {
+    return String.raw`<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NooMiChat Admin</title>
+<style>
+:root{
+  color-scheme:light;
+  --bg:#f5f7fb;
+  --mica:rgba(255,255,255,.72);
+  --card:#ffffff;
+  --card-soft:rgba(255,255,255,.84);
+  --line:#e1e1e1;
+  --line-strong:#c8c6c4;
+  --text:#1f2937;
+  --muted:#667085;
+  --blue:#0078d4;
+  --blue-dark:#005a9e;
+  --green:#107c10;
+  --red:#c50f1f;
+  --amber:#ffaa44;
+  --shadow-sm:0 1.6px 3.6px rgba(0,0,0,.13),0 .3px .9px rgba(0,0,0,.10);
+  --shadow-md:0 3.2px 7.2px rgba(0,0,0,.13),0 .6px 1.8px rgba(0,0,0,.10);
+  --shadow-lg:0 6.4px 14.4px rgba(0,0,0,.13),0 1.2px 3.6px rgba(0,0,0,.10);
+  --radius:12px;
+  font-family:"Segoe UI Variable","Segoe UI",system-ui,-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{
+  margin:0;
+  min-height:100vh;
+  color:var(--text);
+  background:
+    radial-gradient(circle at 10% -10%,rgba(0,120,212,.18),transparent 34rem),
+    radial-gradient(circle at 92% 4%,rgba(16,124,16,.12),transparent 28rem),
+    linear-gradient(180deg,#fbfdff 0,#f3f6fb 42%,#eef3f9 100%);
+  background-attachment:fixed
+}
+body:before{
+  content:"";
+  position:fixed;
+  inset:0;
+  pointer-events:none;
+  background-image:linear-gradient(rgba(255,255,255,.45) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.45) 1px,transparent 1px);
+  background-size:42px 42px;
+  mask-image:linear-gradient(to bottom,rgba(0,0,0,.38),transparent 62%)
+}
+.shell{position:relative;max-width:1240px;margin:0 auto;padding:24px 18px 56px}
+.nav{
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  gap:16px;
+  margin-bottom:18px;
+  padding:14px;
+  border:1px solid rgba(255,255,255,.82);
+  border-bottom-color:var(--line);
+  border-radius:18px;
+  background:var(--mica);
+  box-shadow:var(--shadow-sm);
+  backdrop-filter:blur(18px) saturate(1.35);
+  -webkit-backdrop-filter:blur(18px) saturate(1.35)
+}
+.brand{display:flex;align-items:center;gap:13px;min-width:0}
+.logo{
+  width:46px;
+  height:46px;
+  border-radius:12px;
+  display:grid;
+  place-items:center;
+  background:linear-gradient(135deg,#eff6ff,#dbeafe);
+  border:1px solid rgba(0,120,212,.18);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.9),var(--shadow-sm);
+  font-size:22px
+}
+h1{font-size:25px;line-height:1.1;margin:0;letter-spacing:-.03em;font-weight:700}
+.sub{margin-top:5px;color:var(--muted);font-size:13px}
+.badge{
+  border:1px solid var(--line);
+  background:rgba(255,255,255,.72);
+  border-radius:999px;
+  padding:8px 12px;
+  color:#475467;
+  font-size:12px;
+  white-space:nowrap;
+  box-shadow:var(--shadow-sm)
+}
+.glass{
+  background:var(--card-soft);
+  border:1px solid rgba(255,255,255,.86);
+  border-bottom-color:var(--line);
+  box-shadow:var(--shadow-sm);
+  backdrop-filter:blur(16px) saturate(1.25);
+  -webkit-backdrop-filter:blur(16px) saturate(1.25)
+}
+.login{max-width:460px;margin:54px auto 0;border-radius:18px;padding:28px}
+.login:before{
+  content:"NooMiChat";
+  display:inline-flex;
+  margin-bottom:18px;
+  padding:5px 10px;
+  border-radius:999px;
+  color:var(--blue-dark);
+  background:#eff6ff;
+  border:1px solid #dbeafe;
+  font-size:12px;
+  font-weight:700
+}
+.login h2,.card h2{margin:0 0 8px;font-size:18px;letter-spacing:-.02em;font-weight:700}
+.muted{color:var(--muted)}
+label{display:block;margin:14px 0 7px;font-size:13px;color:#344054;font-weight:650}
+input,select,textarea{
+  width:100%;
+  border:1px solid #8a8886;
+  background:rgba(255,255,255,.94);
+  color:var(--text);
+  border-radius:8px;
+  padding:11px 12px;
+  font:inherit;
+  outline:0;
+  box-shadow:inset 0 1px 2px rgba(0,0,0,.04);
+  transition:border-color .15s ease,box-shadow .15s ease,background .15s ease
+}
+textarea{min-height:92px;resize:vertical;line-height:1.55}
+input::placeholder,textarea::placeholder{color:#98a2b3}
+input:focus,select:focus,textarea:focus{
+  border-color:var(--blue);
+  background:#fff;
+  box-shadow:0 0 0 3px rgba(0,120,212,.15),inset 0 1px 2px rgba(0,0,0,.04)
+}
+button{
+  border:1px solid rgba(0,0,0,.04);
+  border-radius:8px;
+  padding:10px 14px;
+  background:var(--blue);
+  color:#fff;
+  font-weight:700;
+  cursor:pointer;
+  box-shadow:var(--shadow-sm);
+  transition:transform .15s ease,box-shadow .15s ease,background .15s ease,opacity .15s ease
+}
+button:hover{background:var(--blue-dark);box-shadow:var(--shadow-md)}
+button:active{transform:scale(.99)}
+button:focus-visible{outline:3px solid rgba(0,120,212,.22);outline-offset:2px}
+button:disabled{opacity:.58;cursor:not-allowed;transform:none}
+.secondary{background:#fff;color:#344054;border-color:var(--line-strong)}
+.secondary:hover{background:#f8fafc;color:#1d2939}
+.green{background:var(--green)}
+.green:hover{background:#0e6f0e}
+.red{background:var(--red)}
+.red:hover{background:#a80000}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.grid{display:grid;grid-template-columns:minmax(0,1.05fr) minmax(340px,.95fr);gap:16px;align-items:start}
+.settings-layout{display:flex;gap:22px;align-items:flex-start;margin-top:16px}
+.side-tabs{width:230px;flex:0 0 230px;position:sticky;top:18px}
+.side-tabs-inner{display:flex;flex-direction:column;gap:6px;padding:6px}
+.tab-btn{
+  display:flex;
+  width:100%;
+  align-items:center;
+  justify-content:flex-start;
+  gap:10px;
+  border:0;
+  background:transparent;
+  color:#667085;
+  box-shadow:none;
+  padding:11px 12px;
+  border-radius:10px;
+  font-size:14px;
+  font-weight:650;
+  text-align:left
+}
+.tab-btn:hover{background:rgba(255,255,255,.72);color:#344054;box-shadow:none}
+.tab-btn.active{background:#fff;color:#111827;box-shadow:var(--shadow-sm)}
+.tab-btn .ico{width:22px;height:22px;display:grid;place-items:center;border-radius:7px;background:#f2f4f7;font-size:13px}
+.tab-btn.active .ico{background:#eff6ff;color:var(--blue-dark)}
+.tab-content{flex:1;min-width:0}
+.tab-panel{display:none}
+.tab-panel.active{display:block}
+.panel-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(320px,.92fr);gap:16px;align-items:start}
+.panel-head{margin-bottom:14px}
+.panel-head h2{font-size:22px;margin:0 0 4px;letter-spacing:-.03em}
+.panel-head p{margin:0;color:var(--muted);font-size:14px;line-height:1.6}
+.hero{
+  display:flex;
+  justify-content:space-between;
+  align-items:flex-end;
+  gap:18px;
+  margin-bottom:16px;
+  padding:22px;
+  border-radius:18px;
+  overflow:hidden
+}
+.hero h2{margin:6px 0 0;font-size:26px;letter-spacing:-.04em}
+.hero p{margin:8px 0 0;color:var(--muted);line-height:1.65;max-width:680px}
+.eyebrow{
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+  padding:5px 10px;
+  border:1px solid #bfdbfe;
+  border-radius:999px;
+  color:var(--blue-dark);
+  background:#eff6ff;
+  font-size:12px;
+  font-weight:800
+}
+.hero-metrics{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+.hero-metrics span{
+  display:inline-flex;
+  align-items:center;
+  border:1px solid var(--line);
+  border-radius:999px;
+  padding:7px 10px;
+  background:#fff;
+  color:#475467;
+  font-size:12px;
+  font-weight:700;
+  box-shadow:var(--shadow-sm)
+}
+.card{position:relative;border-radius:14px;padding:18px}
+.card:after{
+  content:"";
+  position:absolute;
+  left:18px;
+  top:0;
+  width:52px;
+  height:3px;
+  border-radius:999px;
+  background:linear-gradient(90deg,var(--blue),rgba(0,120,212,0))
+}
+.full{grid-column:1/-1}
+.stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:16px}
+.stat{border-radius:14px;padding:15px 16px;position:relative;overflow:hidden}
+.stat:before{content:"";position:absolute;inset:0 0 auto 0;height:3px;background:linear-gradient(90deg,var(--blue),transparent)}
+.stat b{display:block;font-size:22px;letter-spacing:-.03em;margin-top:4px}
+.stat span{color:var(--muted);font-size:12px;font-weight:650;text-transform:uppercase;letter-spacing:.04em}
+.pill{
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+  border-radius:999px;
+  padding:5px 10px;
+  border:1px solid var(--line);
+  background:#fff;
+  font-size:12px;
+  font-weight:700;
+  box-shadow:var(--shadow-sm)
+}
+.ok{color:var(--green)}
+.bad{color:var(--red)}
+.warn{color:#b45309}
+pre{
+  margin:12px 0 0;
+  white-space:pre-wrap;
+  word-break:break-word;
+  background:#f8fafc;
+  border:1px solid var(--line);
+  border-radius:10px;
+  padding:12px;
+  max-height:300px;
+  overflow:auto;
+  font-size:12px;
+  line-height:1.55;
+  color:#344054
+}
+.hidden{display:none!important}
+.hint{margin-top:12px;font-size:13px;line-height:1.65;color:var(--muted)}
+.hint.bad{color:var(--red)}
+.toast{
+  position:fixed;
+  right:22px;
+  bottom:22px;
+  display:none;
+  max-width:420px;
+  border-radius:12px;
+  padding:14px 16px;
+  background:#f0fdf4;
+  border:1px solid #bbf7d0;
+  box-shadow:var(--shadow-lg);
+  color:#166534;
+  font-weight:800;
+  z-index:9999
+}
+.toast.bad{background:#fef2f2;border-color:#fecaca;color:#991b1b}
+.split{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.admin-list{display:grid;gap:8px}
+.admin-item{
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  gap:10px;
+  border:1px solid var(--line);
+  background:#fff;
+  padding:11px;
+  border-radius:10px;
+  box-shadow:0 .8px 1.8px rgba(0,0,0,.06)
+}
+.admin-item code{color:var(--blue-dark);font-weight:700}
+.footer-note{
+  margin-top:18px;
+  color:#667085;
+  font-size:12px;
+  text-align:center
+}
+@media(max-width:900px){
+  .shell{padding:14px 12px 40px}
+  .grid,.split,.stats{grid-template-columns:1fr}
+  .settings-layout{display:block}
+  .side-tabs{position:static;width:auto;flex:auto;margin-bottom:14px;overflow:auto}
+  .side-tabs-inner{flex-direction:row;min-width:max-content}
+  .tab-btn{white-space:nowrap}
+  .panel-grid{grid-template-columns:1fr}
+  .hero{display:block}
+  .hero-metrics{justify-content:flex-start;margin-top:14px}
+  .nav{align-items:flex-start}
+  .badge{display:none}
+  .login{margin-top:24px}
+}
+@media(prefers-reduced-motion:reduce){
+  html{scroll-behavior:auto}
+  button,input,select,textarea{transition:none}
+}
+</style>
+</head>
+<body>
+<div class="shell">
+  <div class="nav">
+    <div class="brand"><div class="logo">✈️</div><div><h1>NooMiChat Admin</h1><div class="sub">SaaS 控制台 · 验证网关 · Telegram 中继</div></div></div>
+    <div class="badge">v1.1.23 · Settings Tabs UI</div>
+  </div>
+
+  <section id="loginCard" class="login glass">
+    <h2>进入管理后台</h2>
+    <div class="muted">输入 Cloudflare 环境变量中的 ADMIN_KEY；未设置时可临时使用 OWNER_ID。</div>
+    <label for="adminKey">后台密码</label>
+    <input id="adminKey" type="password" autocomplete="current-password" placeholder="ADMIN_KEY / OWNER_ID">
+    <div class="row" style="margin-top:14px"><button id="loginBtn" type="button">进入后台</button><button id="checkBtn" class="secondary" type="button">检查部署</button></div>
+    <div id="loginMsg" class="hint">登录前不会请求管理数据。</div>
+  </section>
+
+  <main id="app" class="hidden">
+    <section class="hero glass">
+      <div>
+        <div class="eyebrow">Fluent Control Center</div>
+        <h2>中继、验证、黑名单和协管，都在一个清爽面板里。</h2>
+        <p>优先展示运行状态，保存只提交变更项；Webhook、菜单、诊断都保持手动触发，避免后台空转吃性能。</p>
+      </div>
+      <div class="hero-metrics"><span>低动画</span><span>D1 Ready</span><span>Bot Safe</span></div>
+    </section>
+    <section class="stats">
+      <div class="stat glass"><span>Worker</span><b id="statWorker">--</b></div>
+      <div class="stat glass"><span>KV</span><b id="statKv">--</b></div>
+      <div class="stat glass"><span>D1</span><b id="statD1">--</b></div>
+      <div class="stat glass"><span>Group</span><b id="statGroup">--</b></div>
+    </section>
+    <section class="settings-layout">
+      <nav class="side-tabs glass" aria-label="后台设置分类">
+        <div class="side-tabs-inner">
+          <button class="tab-btn active" type="button" data-tab="overview"><span class="ico">⌂</span>总览</button>
+          <button class="tab-btn" type="button" data-tab="runtime"><span class="ico">◐</span>中继</button>
+          <button class="tab-btn" type="button" data-tab="verify"><span class="ico">◆</span>验证</button>
+          <button class="tab-btn" type="button" data-tab="messages"><span class="ico">✎</span>文案</button>
+          <button class="tab-btn" type="button" data-tab="access"><span class="ico">⚿</span>管理</button>
+        </div>
+      </nav>
+      <div class="tab-content">
+        <section class="tab-panel active" data-panel="overview">
+          <div class="panel-head"><h2>部署总览</h2><p>检查 Worker、Webhook、菜单和绑定状态。这里的请求只在点击时触发。</p></div>
+          <div class="panel-grid">
+            <div class="card glass"><h2>部署控制</h2><div id="status" class="muted">等待加载</div><div class="row" style="margin-top:12px"><button id="webhookBtn" class="green" type="button">设置 Webhook + 菜单</button><button id="commandsBtn" class="secondary" type="button">仅设置菜单</button><button id="diagBtn" class="secondary" type="button">运行诊断</button><button id="refreshBtn" class="secondary" type="button">刷新</button></div><pre id="diagBox">点击“运行诊断”查看 Telegram Webhook 状态。</pre></div>
+            <div class="card glass"><h2>运行信息</h2><pre id="workerInfo"></pre><a id="openWebhook" target="_blank" rel="noreferrer"><button class="secondary" type="button">打开 Webhook 地址</button></a></div>
+          </div>
+        </section>
+        <section class="tab-panel" data-panel="runtime">
+          <div class="panel-head"><h2>营业与中继</h2><p>控制营业状态、忙碌提示、AI 翻译和联合封禁开关。</p></div>
+          <div class="card glass"><h2>营业与中继</h2><div class="split"><div><label>营业状态</label><select id="business_status"><option value="open">营业中</option><option value="rest">休息中</option></select></div><div><label>休息提示冷却秒数</label><input id="business_rest_cooldown" type="number" min="60"></div></div><label>休息提示</label><textarea id="business_rest_message"></textarea><div class="split"><div><label>AI 翻译</label><select id="ai_translate"><option value="0">关闭</option><option value="1">开启</option></select></div><div><label>联合封禁</label><select id="union_ban"><option value="0">关闭</option><option value="1">开启</option></select></div></div><button id="saveRuntimeBtn" type="button">保存营业设置</button></div>
+        </section>
+        <section class="tab-panel" data-panel="verify">
+          <div class="panel-head"><h2>新用户验证</h2><p>设置云端验证码、本地问答、失败封禁和长时间未聊后的重新验证。</p></div>
+          <div class="card glass"><h2>新用户验证</h2><div class="split"><div><label>云端验证码</label><select id="verify_captcha_mode"><option value="off">关闭</option><option value="cloudflare_turnstile">Cloudflare Turnstile</option><option value="google_recaptcha">Google reCAPTCHA</option></select></div><div><label>本地问答</label><select id="verify_question_mode"><option value="off">关闭</option><option value="math">数学题</option><option value="button_math">算术按钮</option><option value="sticker">发送贴纸</option><option value="emoji_choice">表情选择</option><option value="word_button">文字按钮</option><option value="image_digit">图片数字</option><option value="custom_question">自定义问答</option></select></div></div><div class="split"><div><label>组合模式</label><select id="verify_combo_mode"><option value="captcha_only">只验证码</option><option value="question_only">只问答</option><option value="captcha_question">验证码 + 问答</option></select></div><div><label>失败封禁次数</label><input id="verify_fail_limit" type="number" min="1" max="9"></div></div><label>多久不发消息需要重新验证（小时，0关闭）</label><input id="verify_inactive_hours" type="number" min="0" max="8760" placeholder="例如 1、2、6、12、24"><label>图片数字第三方 API（可空，失败自动本地生成）</label><input id="verify_image_api_url" placeholder="https://example.com/verify-image"><label>本地申诉链接（可空，Bot 内申诉仍可用）</label><input id="local_appeal_url"><label>联合封禁申诉链接</label><input id="union_appeal_url"><button id="saveVerifyBtn" type="button">保存验证设置</button><div class="hint">表情选择和文字按钮都是纯聊天内验证，不跳转网页。</div></div>
+        </section>
+        <section class="tab-panel" data-panel="messages">
+          <div class="panel-head"><h2>消息文案</h2><p>修改验证通过欢迎语、自动回复、品牌说明和欢迎按钮。</p></div>
+          <div class="card glass"><h2>消息文案</h2><div class="split"><div><label>欢迎语（支持 HTML 链接）</label><textarea id="welcome_msg" placeholder='例如：欢迎，点击 <a href="https://t.me/xxx">联系客服</a>'></textarea></div><div><label>自动回复</label><textarea id="auto_reply_msg"></textarea></div></div><div class="split"><div><label>底部品牌文案（支持 HTML 链接，留空关闭）</label><textarea id="brand_msg"></textarea></div><div><label>欢迎按钮</label><textarea id="welcome_buttons_text" placeholder="按钮文字 - https://t.me/xxx, 官网 - https://example.com"></textarea></div></div><button id="saveMsgBtn" type="button">保存文案</button><div class="hint">Telegram 文字链接写法：<code>&lt;a href=&quot;https://t.me/xxx&quot;&gt;点击这里&lt;/a&gt;</code>。按钮格式：按钮名 - 链接，多个用英文逗号分隔。</div></div>
+        </section>
+        <section class="tab-panel" data-panel="access">
+          <div class="panel-head"><h2>黑名单与协管</h2><p>管理本地黑名单、申诉处理入口和协管员权限。</p></div>
+          <div class="panel-grid">
+            <div class="card glass"><h2>本地黑名单</h2><div class="split"><div><label>搜索 / 操作 Telegram ID</label><input id="blackUserId" placeholder="输入用户数字 ID"></div><div><label>封禁原因</label><input id="blackReason" placeholder="后台手动封禁"></div></div><div class="row"><button id="searchBlackBtn" class="secondary" type="button">搜索</button><button id="banBlackBtn" class="red" type="button">加入黑名单</button><button id="unbanBlackBtn" class="green" type="button">解除封禁</button><button id="refreshBlackBtn" class="secondary" type="button">刷新列表</button></div><div id="blacklist" class="admin-list" style="margin-top:12px"></div></div>
+            <div class="card glass"><h2>协管管理</h2><div class="split"><div><label>Telegram ID</label><input id="adminUserId" placeholder="例如 123456789"></div><div><label>权限</label><input id="adminPerms" placeholder="reply,panel,ban,config"></div></div><div class="row"><button id="addAdminBtn" type="button">添加/更新协管</button><span class="hint">OWNER_ID 默认全权限，不可删除。</span></div><div id="admins" class="admin-list" style="margin-top:12px"></div></div>
+          </div>
+        </section>
+      </div>
+    </section>
+    <div class="footer-note">Fluent / Mica 轻量界面：低动画、低阴影、轻量 JS；诊断和 Telegram API 只在点击时请求。</div>
+  </main>
+</div>
+<div id="toast" class="toast"></div>
+<script>
+(function(){
+  var $ = function(id){ return document.getElementById(id); };
+  var NL = String.fromCharCode(10);
+  var configKeys = ['business_status','business_rest_message','business_rest_cooldown','ai_translate','union_ban','verify_captcha_mode','verify_question_mode','verify_combo_mode','verify_fail_limit','verify_inactive_hours','verify_image_api_url','local_appeal_url','union_appeal_url','welcome_msg','brand_msg','welcome_buttons_text','auto_reply_msg'];
+  var lastConfig = {};
+  $('adminKey').value = localStorage.getItem('noomichat_admin_key') || localStorage.getItem('relaygo_admin_key') || '';
+  function toast(msg,isBad){ var el=$('toast'); el.textContent=(isBad?'⚠️ ':'✅ ')+msg; el.className='toast '+(isBad?'bad':''); el.style.display='block'; clearTimeout(window.__toastTimer); window.__toastTimer=setTimeout(function(){el.style.display='none';},3600); }
+  function h(v){ return String(v==null?'':v).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];}); }
+  function setBusy(btn,busy){ if(!btn)return; btn.disabled=!!busy; if(busy){btn.dataset.old=btn.textContent; btn.textContent='处理中...';} else if(btn.dataset.old){btn.textContent=btn.dataset.old; delete btn.dataset.old;} }
+  async function parseResponse(res){ var text=await res.text(); try{return text?JSON.parse(text):{};}catch(e){return {error:text||('HTTP '+res.status),raw:text};} }
+  async function api(path,opt){ opt=opt||{}; var key=$('adminKey').value.trim(); var headers=Object.assign({'content-type':'application/json','x-admin-key':key},opt.headers||{}); var res=await fetch(path,Object.assign({},opt,{headers:headers})); var data=await parseResponse(res); if(!res.ok) throw new Error(data.error||data.raw||res.statusText); return data; }
+  function showLogin(msg,isBad){ $('loginCard').classList.remove('hidden'); $('app').classList.add('hidden'); if(msg){ $('loginMsg').innerHTML=msg; $('loginMsg').className='hint '+(isBad?'bad':''); } }
+  function showApp(){ $('loginCard').classList.add('hidden'); $('app').classList.remove('hidden'); }
+  function activateTab(name){ if(!document.querySelector('.tab-btn[data-tab="'+name+'"]')) name='overview'; document.querySelectorAll('.tab-btn').forEach(function(btn){ btn.classList.toggle('active',btn.dataset.tab===name); }); document.querySelectorAll('.tab-panel').forEach(function(panel){ panel.classList.toggle('active',panel.dataset.panel===name); }); localStorage.setItem('noomichat_admin_tab',name); }
+  function fillAdmins(admins){ var box=$('admins'); box.innerHTML=''; if(!admins||!admins.length){ box.innerHTML='<div class="muted">暂无协管</div>'; return; } admins.forEach(function(a){ var item=document.createElement('div'); item.className='admin-item'; var left=document.createElement('div'); left.innerHTML='<code>'+a.user_id+'</code><div class="muted">'+(a.is_owner?'OWNER':'ADMIN')+' · '+(a.permissions||[]).join(',')+'</div>'; var right=document.createElement('button'); right.type='button'; right.className='red'; right.textContent='删除'; right.disabled=!!a.is_owner; right.addEventListener('click',function(){ delAdmin(a.user_id); }); item.appendChild(left); item.appendChild(right); box.appendChild(item); }); }
+  function fillBlacklist(items){ var box=$('blacklist'); box.innerHTML=''; if(!items||!items.length){ box.innerHTML='<div class="muted">暂无本地黑名单记录</div>'; return; } items.forEach(function(x){ var u=x.user||{}; var name=((u.first_name||'')+' '+(u.last_name||'')).trim()||'Unknown'; var item=document.createElement('div'); item.className='admin-item'; var left=document.createElement('div'); left.innerHTML='<code>'+h(x.user_id)+'</code><div class="muted">'+h(name)+(u.username?' @'+h(u.username):'')+' · '+(x.lifted_at?'已解封':'封禁中')+'</div><div class="hint">原因：'+h(x.reason||'-')+'</div>'; var right=document.createElement('button'); right.type='button'; right.className=x.lifted_at?'secondary':'green'; right.textContent=x.lifted_at?'已解封':'解封'; right.disabled=!!x.lifted_at; right.addEventListener('click',function(){ unbanBlack(x.user_id); }); item.appendChild(left); item.appendChild(right); box.appendChild(item); }); }
+  function fill(s){ showApp(); var cfg=s.settings||{}; lastConfig=Object.assign({},cfg); var runtime=s.runtime||{}; var kv=runtime.kv||{}; var ready=s.status==='running'; $('status').innerHTML='<span class="pill '+(ready?'ok':'warn')+'">'+(ready?'运行中':'配置未就绪')+'</span> '+(s.version||''); $('statWorker').textContent=ready?'OK':'WARN'; $('statKv').textContent=kv.valid?'OK':'NO'; $('statD1').textContent=runtime.d1?'OK':'NO'; $('statGroup').textContent=cfg.group_id?'已绑定':'未绑定'; $('workerInfo').textContent='Worker: '+(cfg.worker_url||'')+NL+'Webhook: '+(cfg.webhook_url||'')+NL+'Group ID: '+(cfg.group_id||'未绑定')+NL+'Runtime: '+JSON.stringify(runtime,null,2); $('openWebhook').href=cfg.webhook_url||'#'; configKeys.forEach(function(k){ if($(k)) $(k).value = cfg[k] == null ? '' : cfg[k]; }); fillAdmins(s.admins||[]); }
+  async function loadState(){ var btn=$('loginBtn'); try{ setBusy(btn,true); localStorage.setItem('noomichat_admin_key',$('adminKey').value.trim()); fill(await api('/api/status')); loadBlacklist(); toast('已进入后台'); } catch(e){ showLogin('<b>登录失败：</b>'+e.message+'<br>请检查 ADMIN_KEY / OWNER_ID。',true); toast(e.message,true); } finally { setBusy(btn,false); } }
+  async function runPublicCheck(){ try{ var r=await (await fetch('/')).json(); $('loginMsg').innerHTML='<pre>'+JSON.stringify(r,null,2)+'</pre>'; $('loginMsg').className='hint'; }catch(e){ showLogin('检查失败：'+e.message,true); } }
+  async function setWebhook(){ var b=$('webhookBtn'); try{ setBusy(b,true); var r=await api('/api/webhook/set',{method:'POST',body:'{}'}); $('diagBox').textContent=JSON.stringify(r,null,2); toast(r.telegram&&r.telegram.ok?'Webhook 已设置':'设置失败'); await loadState(); }catch(e){toast(e.message,true);}finally{setBusy(b,false);} }
+  async function setCommands(){ var b=$('commandsBtn'); try{ setBusy(b,true); var r=await api('/api/commands/set',{method:'POST',body:'{}'}); $('diagBox').textContent=JSON.stringify(r,null,2); toast(r.ok?'菜单已设置':'设置失败'); }catch(e){toast(e.message,true);}finally{setBusy(b,false);} }
+  async function runDiagnostics(){ var b=$('diagBtn'); try{ setBusy(b,true); var r=await api('/api/diagnostics'); $('diagBox').textContent=JSON.stringify(r.checks||r,null,2); toast('诊断完成'); }catch(e){toast(e.message,true);}finally{setBusy(b,false);} }
+  async function saveConfig(){ var btn=document.activeElement&&document.activeElement.tagName==='BUTTON'?document.activeElement:null; var originalText=btn?btn.textContent:''; var saved=false; var body={}; configKeys.forEach(function(k){ if($(k)){ var v=$(k).value; if(String(lastConfig[k] == null ? '' : lastConfig[k])!==String(v)) body[k]=v; } }); if(!Object.keys(body).length){toast('没有变更');return;} try{ setBusy(btn,true); var started=Date.now(); await api('/api/config',{method:'POST',body:JSON.stringify(body)}); Object.assign(lastConfig,body); saved=true; toast('已保存 '+Object.keys(body).length+' 项 · '+(Date.now()-started)+'ms'); }catch(e){toast(e.message,true);}finally{setBusy(btn,false); if(btn&&saved){btn.textContent='已保存'; setTimeout(function(){ if(btn) btn.textContent=originalText; },1200);} } }
+  async function addAdmin(){ var userId=$('adminUserId').value.trim(); var perms=$('adminPerms').value.trim()||'reply,panel'; if(!userId){toast('请输入 Telegram ID',true);return;} try{ var r=await api('/api/admins',{method:'POST',body:JSON.stringify({user_id:userId,permissions:perms})}); fill(r.state); $('adminUserId').value=''; toast('协管已保存'); }catch(e){toast(e.message,true);} }
+  async function delAdmin(userId){ if(!confirm('删除协管 '+userId+' ?')) return; try{ var r=await api('/api/admins/delete',{method:'POST',body:JSON.stringify({user_id:userId})}); fill(r.state); toast('协管已删除'); }catch(e){toast(e.message,true);} }
+  async function loadBlacklist(){ try{ var uid=$('blackUserId').value.trim(); var r=await api('/api/blacklist'+(uid?'?user_id='+encodeURIComponent(uid):'')); fillBlacklist(r.items||[]); }catch(e){toast(e.message,true);} }
+  async function banBlack(){ var uid=$('blackUserId').value.trim(); if(!uid){toast('请输入 Telegram ID',true);return;} try{ var r=await api('/api/blacklist/ban',{method:'POST',body:JSON.stringify({user_id:uid,reason:$('blackReason').value.trim()||'后台手动封禁'})}); fillBlacklist(r.items||[]); toast('已加入本地黑名单'); }catch(e){toast(e.message,true);} }
+  async function unbanBlack(uid){ uid=uid||$('blackUserId').value.trim(); if(!uid){toast('请输入 Telegram ID',true);return;} try{ var r=await api('/api/blacklist/unban',{method:'POST',body:JSON.stringify({user_id:uid})}); fillBlacklist(r.items||[]); toast('已解除封禁'); }catch(e){toast(e.message,true);} }
+  document.querySelectorAll('.tab-btn').forEach(function(btn){ btn.addEventListener('click',function(){ activateTab(btn.dataset.tab); }); });
+  activateTab(localStorage.getItem('noomichat_admin_tab') || 'overview');
+  $('loginBtn').addEventListener('click',loadState); $('checkBtn').addEventListener('click',runPublicCheck); $('adminKey').addEventListener('keydown',function(e){ if(e.key==='Enter') loadState(); }); $('webhookBtn').addEventListener('click',setWebhook); $('commandsBtn').addEventListener('click',setCommands); $('diagBtn').addEventListener('click',runDiagnostics); $('refreshBtn').addEventListener('click',loadState); $('saveRuntimeBtn').addEventListener('click',saveConfig); $('saveVerifyBtn').addEventListener('click',saveConfig); $('saveMsgBtn').addEventListener('click',saveConfig); $('addAdminBtn').addEventListener('click',addAdmin); $('searchBlackBtn').addEventListener('click',loadBlacklist); $('refreshBlackBtn').addEventListener('click',function(){ $('blackUserId').value=''; loadBlacklist(); }); $('banBlackBtn').addEventListener('click',banBlack); $('unbanBlackBtn').addEventListener('click',function(){ unbanBlack(); }); if($('adminKey').value) loadState();
+})();
+</script>
+</body>
+</html>`;
+}
+
 export default {
     async fetch(request, env, ctx) {
+        env = normalizeEnv(env);
         if (request.method === 'OPTIONS') return new Response(null, { headers: CORS_HEADERS });
 
         try {
@@ -441,13 +1100,34 @@ export default {
                 return handleWebAdminApi(request, env);
             }
             if (request.method === 'POST' && (url.pathname === '/webhook' || url.pathname.startsWith('/webhook'))) {
+                assertWebhookReady(env);
                 const update = await request.json();
-                ctx.waitUntil(handleUpdate(env, update, ctx));
+                await handleUpdate(env, update, ctx);
                 return jsonResponse({ ok: true });
             }
-            return jsonResponse({ status: 'running', version: '1.1.6 (Standalone)', admin: `${url.origin}/admin`, webhook: `${url.origin}/webhook` });
+            const problems = getRuntimeProblems(env);
+            const verifySettings = await getVerifySettings(env);
+            const unionBanEnabled = await getUnionBanEnabled(env);
+            return jsonResponse({
+                status: problems.length ? 'not_ready' : 'running',
+                version: '1.1.23 (Settings Tabs UI)',
+                admin: `${url.origin}/admin`,
+                webhook: `${url.origin}/webhook`,
+                bindings: { bot_token: !!env.BOT_TOKEN, owner_id: !!env.OWNER_ID, kv: isKVNamespace(env.KV), kv_binding_invalid: !!env.__KV_BINDING_INVALID, d1: !!getD1(env), admin_key: !!(env.ADMIN_KEY || env.ADMIN_PASSWORD) },
+                kv_detail: describeKVBinding(env),
+                verify_effective: {
+                    union_ban: unionBanEnabled,
+                    captcha_mode: verifySettings.captchaMode,
+                    question_mode: verifySettings.questionMode,
+                    combo_mode: verifySettings.comboMode,
+                    should_run_captcha: shouldRunCaptcha(verifySettings, unionBanEnabled),
+                    should_run_question: shouldRunQuestion(verifySettings),
+                    trigger_reason: getVerifyTriggerReason(verifySettings, unionBanEnabled)
+                },
+                problems
+            });
         } catch (e) {
-            ctx.waitUntil(reportError(env, e, "Main Fetch Loop"));
+            if (!String(e.message || '').startsWith('Worker is not ready:')) ctx.waitUntil(reportError(env, e, "Main Fetch Loop"));
             return errorResponse(e.message);
         }
     }
@@ -460,7 +1140,11 @@ async function handleUpdate(env, update, ctx) {
 
     // 1. 处理回调查询
     if (update.callback_query) {
-        if (update.callback_query.data && update.callback_query.data.startsWith('reverify:')) {
+        
+        if (update.callback_query.data && update.callback_query.data.startsWith('appeal:')) {
+            return handleLocalAppealCallback(env, update.callback_query);
+        }
+if (update.callback_query.data && update.callback_query.data.startsWith('reverify:')) {
             return handleReverifyCallback(env, update.callback_query);
         }
         if (update.callback_query.data && update.callback_query.data.startsWith('verify:')) {
@@ -568,6 +1252,12 @@ async function handleUpdate(env, update, ctx) {
     // 私聊消息
     if (update.message && update.message.chat.type === 'private') {
         const currentUserId = String(update.message.from.id);
+        if (!env.KV) {
+            return tgRequest(token, 'sendMessage', {
+                chat_id: currentUserId,
+                text: '⚠️ Worker 缺少 KV 绑定。请在 Cloudflare Worker Bindings 中添加 KV Namespace，变量名必须是 KV，然后重新部署。'
+            });
+        }
         if (await hasPermission(env, currentUserId, 'panel')) {
             return handleOwnerMenu(env, update.message, ctx);
         }
@@ -578,11 +1268,70 @@ async function handleUpdate(env, update, ctx) {
 // 转发消息（支持媒体组相册）
 const mediaGroupBuffers = new Map();
 
-async function forwardMessage(env, token, targetChatId, fromChatId, msg, threadId = null) {
+function getPlainUserName(userInfo = {}) {
+    const firstName = String(userInfo.first_name || '').trim();
+    const lastName = String(userInfo.last_name || '').trim();
+    return `${firstName} ${lastName}`.trim() || 'No Name';
+}
+function getUserLinkButton(userId, userInfo = {}) {
+    const labelName = userInfo.username ? `@${userInfo.username}` : `${getPlainUserName(userInfo)} / ${userId}`;
+    const text = `👤 ${labelName}`.slice(0, 64);
+    if (userInfo.username) return { text, url: `https://t.me/${userInfo.username}` };
+    return { text, callback_data: `identity:${userId}` };
+}
+function formatUserBrief(userId, userData = {}) {
+    const info = userData.user_info || userData || {};
+    const name = formatUserName(info);
+    const username = info.username ? ` @${escapeHtml(info.username)}` : '';
+    return `${name}${username} (${userId})`;
+}
+function formatUserReplyTarget(userId, userData = {}) {
+    const info = userData.user_info || userData || {};
+    const username = info.username ? ` @${escapeHtml(info.username)}` : '';
+    return `<a href="tg://user?id=${userId}">${formatUserName(info)}</a>${username} / <code>${userId}</code>`;
+}
+function buildUserIdentityText(userId, userInfo = {}, title = '📩 用户消息') {
+    const username = userInfo.username ? `@${escapeHtml(userInfo.username)}` : 'None';
+    return `${title}\n\n用户：<a href="tg://user?id=${userId}">${formatUserName(userInfo)}</a>\nUID：<code>${userId}</code>\n用户名：${username}`;
+}
+async function sendUserIdentityCard(env, targetChatId, threadId, userId, userInfo = {}, title = '📩 用户消息') {
+    const payload = {
+        chat_id: targetChatId,
+        text: buildUserIdentityText(userId, userInfo, title),
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[getUserLinkButton(userId, userInfo)]] }
+    };
+    if (threadId) payload.message_thread_id = threadId;
+    const result = await tgRequest(env.BOT_TOKEN, 'sendMessage', payload);
+    if (result.ok && !threadId && String(targetChatId) === String(env.OWNER_ID) && String(userId) !== String(env.OWNER_ID) && env.KV) {
+        await env.KV.put(`owner_reply_map:${result.result.message_id}`, String(userId), { expirationTtl: 86400 * 7 });
+    }
+    return result;
+}
+function isUserCommandMessage(msg) {
+    return !!(msg && typeof msg.text === 'string' && /^\/[A-Za-z0-9_]+(?:@\w+)?(?:\s|$)/.test(msg.text.trim()));
+}
+async function sendUserForwardFeedback(env, userId, text = '✅ 消息已发送。') {
+    const key = `forward_feedback:${userId}`;
+    if (env.KV && await env.KV.get(key)) return;
+    await tgRequest(env.BOT_TOKEN, 'sendMessage', { chat_id: userId, text });
+    if (env.KV) await env.KV.put(key, '1', { expirationTtl: 60 });
+}
+
+async function forwardMessage(env, token, targetChatId, fromChatId, msg, threadId = null, options = {}) {
     if (!msg.media_group_id) {
         const payload = { chat_id: targetChatId, from_chat_id: fromChatId, message_id: msg.message_id };
         if (threadId) payload.message_thread_id = threadId;
-        return tgRequest(token, 'copyMessage', payload);
+        if (options.reply_markup) payload.reply_markup = options.reply_markup;
+        let result = await tgRequest(token, 'copyMessage', payload);
+        if (!result.ok && payload.reply_markup && String(result.description || '').includes('BUTTON_USER_PRIVACY_RESTRICTED')) {
+            delete payload.reply_markup;
+            result = await tgRequest(token, 'copyMessage', payload);
+        }
+        if (result.ok && !threadId && String(targetChatId) === String(env.OWNER_ID) && String(fromChatId) !== String(env.OWNER_ID) && env.KV) {
+            await env.KV.put(`owner_reply_map:${result.result.message_id}`, String(fromChatId), { expirationTtl: 86400 * 7 });
+        }
+        return result;
     }
 
     const groupKey = msg.media_group_id;
@@ -612,7 +1361,12 @@ async function forwardMessage(env, token, targetChatId, fromChatId, msg, threadI
         buffer.messageIds.sort((a, b) => a - b);
         const payload = { chat_id: buffer.targetChatId, from_chat_id: buffer.fromChatId, message_ids: buffer.messageIds };
         if (buffer.threadId) payload.message_thread_id = buffer.threadId;
-        return tgRequest(buffer.token, 'copyMessages', payload);
+        const result = await tgRequest(buffer.token, 'copyMessages', payload);
+        if (result.ok && !buffer.threadId && String(buffer.targetChatId) === String(env.OWNER_ID) && String(buffer.fromChatId) !== String(env.OWNER_ID) && env.KV) {
+            const ids = Array.isArray(result.result) ? result.result : [];
+            await Promise.all(ids.map(id => env.KV.put(`owner_reply_map:${id}`, String(buffer.fromChatId), { expirationTtl: 86400 * 7 })));
+        }
+        return result;
     }
 }
 
@@ -643,15 +1397,27 @@ async function getLang(env, msg) { const mode = await getConfig(env, 'language',
 function t(lang, key) { return (I18N[lang] && I18N[lang][key]) || I18N.zh[key] || key; }
 function isEnabled(value, defaultValue = false) { if (value === null || value === undefined) return defaultValue; return value === '1' || value === 'true'; }
 async function getAntiSpamConfig(env) {
-    const keys = ['config:antispam','config:antispam_link','config:antispam_media','config:antispam_keyword','config:antispam_autoban'];
-    const values = await Promise.all(keys.map(k => env.KV.get(k)));
+    const keys = ['antispam', 'antispam_link', 'antispam_media', 'antispam_keyword', 'antispam_autoban'];
+    const values = await Promise.all(keys.map(key => getConfig(env, key)));
     return { enabled: isEnabled(values[0], true), blockLinks: isEnabled(values[1], true), blockMedia: isEnabled(values[2], true), blockKeywords: isEnabled(values[3], true), autoBan: isEnabled(values[4], false), windowShort: 10, limitShort: 5, windowLong: 60, limitLong: 15, cooldown: 300, newUserMaxMedia: 3 };
 }
 
 async function tgFormRequest(token, method, formData) {
     const url = `https://api.telegram.org/bot${token}/${method}`;
     try {
-        const resp = await fetch(url, { method: 'POST', body: formData });
+        let body = formData;
+        if (!(formData instanceof FormData)) {
+            const form = new FormData();
+            const filename = formData && formData.filename ? String(formData.filename) : 'noomichat.png';
+            for (const [key, value] of Object.entries(formData || {})) {
+                if (key === 'filename' || value === undefined || value === null) continue;
+                if (value instanceof Blob) form.append(key, value, filename);
+                else if (typeof value === 'object') form.append(key, JSON.stringify(value));
+                else form.append(key, String(value));
+            }
+            body = form;
+        }
+        const resp = await fetch(url, { method: 'POST', body });
         const result = await resp.json();
         if (!result.ok) console.error(`[TG API Error] Method: ${method}, Error: ${result.description}`);
         return result;
@@ -717,27 +1483,199 @@ function makeDigitSvg(digit) {
     return `<svg xmlns="http://www.w3.org/2000/svg" width="160" height="80" viewBox="0 0 160 80"><rect width="160" height="80" fill="#f5f7fb"/><g transform="translate(80 48) rotate(${randomInt(-15, 15)})"><text text-anchor="middle" font-size="48" font-family="Arial, sans-serif" font-weight="700" fill="#1f2937">${digit}</text></g>${noise}<circle cx="${randomInt(15,145)}" cy="${randomInt(10,70)}" r="3" fill="#60a5fa" opacity=".5"/></svg>`;
 }
 function svgDataUrl(svg) { return 'data:image/svg+xml;base64,' + btoa(unescape(encodeURIComponent(svg))); }
+const CRC32_TABLE = (() => {
+    const table = new Uint32Array(256);
+    for (let i = 0; i < 256; i++) {
+        let c = i;
+        for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+        table[i] = c >>> 0;
+    }
+    return table;
+})();
+function u32be(n) { return new Uint8Array([(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255]); }
+function concatBytes(parts) {
+    const total = parts.reduce((sum, part) => sum + part.length, 0);
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const part of parts) { out.set(part, offset); offset += part.length; }
+    return out;
+}
+function crc32(bytes) {
+    let c = 0xffffffff;
+    for (const b of bytes) c = CRC32_TABLE[(c ^ b) & 255] ^ (c >>> 8);
+    return (c ^ 0xffffffff) >>> 0;
+}
+function adler32(bytes) {
+    let a = 1, b = 0;
+    for (const x of bytes) { a = (a + x) % 65521; b = (b + a) % 65521; }
+    return ((b << 16) | a) >>> 0;
+}
+function pngChunk(type, data) {
+    const typeBytes = new TextEncoder().encode(type);
+    return concatBytes([u32be(data.length), typeBytes, data, u32be(crc32(concatBytes([typeBytes, data])))]);
+}
+function zlibStore(bytes) {
+    const parts = [new Uint8Array([0x78, 0x01])];
+    for (let offset = 0; offset < bytes.length; offset += 65535) {
+        const block = bytes.slice(offset, Math.min(offset + 65535, bytes.length));
+        const final = offset + 65535 >= bytes.length ? 1 : 0;
+        const len = block.length;
+        parts.push(new Uint8Array([final, len & 255, (len >>> 8) & 255, (~len) & 255, ((~len) >>> 8) & 255]), block);
+    }
+    parts.push(u32be(adler32(bytes)));
+    return concatBytes(parts);
+}
+function makeDigitPngBlob(digit) {
+    const width = 160, height = 80;
+    const raw = new Uint8Array((width * 4 + 1) * height);
+    for (let y = 0; y < height; y++) {
+        const row = y * (width * 4 + 1);
+        raw[row] = 0;
+        for (let x = 0; x < width; x++) {
+            const i = row + 1 + x * 4;
+            raw[i] = 245; raw[i + 1] = 247; raw[i + 2] = 251; raw[i + 3] = 255;
+        }
+    }
+    function rect(x, y, w, h, r, g, b) {
+        for (let yy = Math.max(0, y); yy < Math.min(height, y + h); yy++) {
+            const row = yy * (width * 4 + 1);
+            for (let xx = Math.max(0, x); xx < Math.min(width, x + w); xx++) {
+                const i = row + 1 + xx * 4;
+                raw[i] = r; raw[i + 1] = g; raw[i + 2] = b; raw[i + 3] = 255;
+            }
+        }
+    }
+    for (let i = 0; i < 18; i++) rect(randomInt(4, 154), randomInt(4, 74), randomInt(1, 5), randomInt(1, 4), 147, 197, 253);
+    const segments = {
+        a: [55, 12, 50, 8], b: [104, 18, 8, 22], c: [104, 43, 8, 22],
+        d: [55, 65, 50, 8], e: [48, 43, 8, 22], f: [48, 18, 8, 22], g: [55, 38, 50, 8]
+    };
+    const map = {
+        0: 'abcdef', 1: 'bc', 2: 'abged', 3: 'abgcd', 4: 'fgbc', 5: 'afgcd',
+        6: 'afgecd', 7: 'abc', 8: 'abcdefg', 9: 'abfgcd'
+    };
+    for (const segment of map[Number(digit)] || map[0]) {
+        const [x, y, w, h] = segments[segment];
+        rect(x, y, w, h, 31, 41, 55);
+    }
+    const ihdr = new Uint8Array(13);
+    ihdr.set(u32be(width), 0); ihdr.set(u32be(height), 4); ihdr[8] = 8; ihdr[9] = 6; ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
+    const png = concatBytes([new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]), pngChunk('IHDR', ihdr), pngChunk('IDAT', zlibStore(raw)), pngChunk('IEND', new Uint8Array())]);
+    return new Blob([png], { type: 'image/png' });
+}
+function base64ToBlob(base64, type = 'image/png') {
+    const clean = String(base64 || '').replace(/^data:[^;]+;base64,/, '');
+    const bin = atob(clean);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new Blob([bytes], { type });
+}
 async function getVerifyFailLimit(env) { return Math.max(1, Math.min(9, parseInt(await getConfig(env, 'verify_fail_limit', '2'), 10) || 2)); }
-async function getAppealUrl(env) { return await getConfig(env, 'appeal_url', 'https://t.me/RelayGo/24'); }
+async function getLocalAppealUrl(env) { return await getConfig(env, 'local_appeal_url', ''); }
+async function getUnionAppealUrl(env) { return await getConfig(env, 'union_appeal_url', 'https://t.me/RelayGo/24'); }
+async function getAppealUrl(env) { return getLocalAppealUrl(env); }
 async function getVerifySettings(env) {
     const legacyMode = await getConfig(env, 'verify_mode', 'off');
     const captchaMode = await getConfig(env, 'verify_captcha_mode', 'off');
     const questionMode = await getConfig(env, 'verify_question_mode', legacyMode === 'off' ? 'off' : legacyMode);
-    const comboMode = await getConfig(env, 'verify_combo_mode', captchaMode !== 'off' && questionMode !== 'off' ? 'captcha_question' : (captchaMode !== 'off' ? 'captcha_only' : 'question_only'));
+    let comboMode = await getConfig(env, 'verify_combo_mode', captchaMode !== 'off' && questionMode !== 'off' ? 'captcha_question' : (captchaMode !== 'off' ? 'captcha_only' : 'question_only'));
+    if (captchaMode === 'off' && questionMode !== 'off' && comboMode === 'captcha_only') comboMode = 'question_only';
+    if (captchaMode !== 'off' && questionMode === 'off' && comboMode === 'question_only') comboMode = 'captcha_only';
+    if (captchaMode === 'off' && questionMode === 'off') comboMode = 'off';
     return { captchaMode, questionMode, comboMode, legacyMode };
 }
-function shouldRunCaptcha(settings, unionBanEnabled) { return unionBanEnabled || ['cloudflare_turnstile', 'google_recaptcha'].includes(settings.captchaMode); }
+function shouldRunCaptcha(settings, unionBanEnabled = false) { return !!unionBanEnabled || ['cloudflare_turnstile', 'google_recaptcha'].includes(settings.captchaMode); }
 function shouldRunQuestion(settings) { return settings.questionMode && settings.questionMode !== 'off' && settings.comboMode !== 'captcha_only'; }
+function hasVerificationEnabled(settings, unionBanEnabled) { return shouldRunCaptcha(settings, unionBanEnabled) || shouldRunQuestion(settings); }
+async function getUnionBanEnabled(env) {
+    const raw = await getConfig(env, 'union_ban', '0');
+    return raw === '1' || raw === 'true' || raw === true;
+}
+function getVerifyTriggerReason(settings, unionBanEnabled) {
+    if (unionBanEnabled) return 'union_ban_enabled';
+    if (['cloudflare_turnstile', 'google_recaptcha'].includes(settings.captchaMode)) return `captcha_mode_${settings.captchaMode}`;
+    if (shouldRunQuestion(settings)) return `question_mode_${settings.questionMode}`;
+    return 'verification_off';
+}
+async function getVerifyInactiveHours(env) {
+    const hoursRaw = await getConfig(env, 'verify_inactive_hours', '');
+    if (hoursRaw !== '' && hoursRaw !== null && hoursRaw !== undefined) {
+        return Math.max(0, Math.min(8760, parseFloat(hoursRaw) || 0));
+    }
+    const legacyDays = Math.max(0, Math.min(365, parseFloat(await getConfig(env, 'verify_inactive_days', '0')) || 0));
+    return legacyDays * 24;
+}
+function formatInactiveHours(hours) {
+    if (!hours) return '关闭';
+    if (hours < 24) return `${hours} 小时`;
+    if (hours === 24) return '1 天';
+    if (hours % 24 === 0) return `${hours / 24} 天`;
+    return `${hours} 小时`;
+}
+async function shouldReverifyInactive(env, userData, settings, unionBanEnabled) {
+    if (!userData || !userData.last_seen || !hasVerificationEnabled(settings, unionBanEnabled)) return false;
+    const hours = await getVerifyInactiveHours(env);
+    if (!hours) return false;
+    return Date.now() - Number(userData.last_seen) > hours * 3600_000;
+}
 async function banUserWithNotice(env, userId, reason = '验证失败') {
     await banUser(env, userId);
-    const appealUrl = await getAppealUrl(env);
+    const appealUrl = await getLocalAppealUrl(env);
     await createBlacklistCard(env, userId, reason, appealUrl);
     const groupId = await getConfig(env, 'group_id');
     const userData = await getUser(env, userId);
     if (groupId && userData) await upsertProfileCard(env, groupId, userId, userData);
-    await tgRequest(env.BOT_TOKEN, 'sendMessage', { chat_id: userId, text: `❌ 您已被封禁。\n原因：${reason}\n如需申诉：${appealUrl}`, disable_web_page_preview: true });
+    const keyboard = [[{ text: '📨 本地申诉（填写理由）', callback_data: `appeal:${userId}` }], [{ text: '🔁 重新验证', callback_data: `reverify:${userId}` }]];
+    if (appealUrl) keyboard.push([{ text: '🔗 本地申诉链接', url: appealUrl }]);
+    await tgRequest(env.BOT_TOKEN, 'sendMessage', { chat_id: userId, text: `❌ 您已被本机器人本地封禁。\n原因：${reason}\n\n你可以点击“本地申诉”并填写理由，管理员会在后台处理。`, disable_web_page_preview: true, reply_markup: { inline_keyboard: keyboard } });
     if (env.OWNER_ID) await tgRequest(env.BOT_TOKEN, 'sendMessage', { chat_id: env.OWNER_ID, text: `🚫 用户被封禁\nUID：${userId}\n原因：${reason}` });
 }
+async function submitLocalAppeal(env, userId, from, reason = '') {
+    const token = env.BOT_TOKEN;
+    const userData = await getUser(env, userId);
+    if (!userData || !userData.is_banned) {
+        return tgRequest(token, 'sendMessage', { chat_id: userId, text: '你当前未被本地封禁，不需要申诉。' });
+    }
+    const cooldownKey = `appeal_cooldown:${userId}`;
+    if (await env.KV.get(cooldownKey)) {
+        return tgRequest(token, 'sendMessage', { chat_id: userId, text: '📨 申诉已提交，请等待管理员处理。' });
+    }
+    const finalReason = String(reason || '').trim().slice(0, 1000) || '用户未填写理由';
+    await env.KV.put(cooldownKey, '1', { expirationTtl: 600 });
+    await env.KV.delete(`appeal_reason_pending:${userId}`);
+    await env.KV.put(`appeal_pending:${userId}`, JSON.stringify({ user_id: userId, created_at: Date.now(), from, reason: finalReason }), { expirationTtl: 86400 });
+    const name = escapeHtml(formatUserName(userData.user_info || from));
+    const username = (userData.user_info && userData.user_info.username) || (from && from.username);
+    const text = `📨 <b>本地封禁申诉</b>\n\n用户：<a href="tg://user?id=${userId}">${name}</a>\nUID：<code>${userId}</code>\n用户名：${username ? '@' + escapeHtml(username) : 'None'}\n\n理由：\n<pre>${escapeHtml(finalReason)}</pre>\n\n请选择处理方式：`;
+    if (env.OWNER_ID) {
+        await tgRequest(token, 'sendMessage', {
+            chat_id: env.OWNER_ID,
+            text,
+            parse_mode: 'HTML',
+            reply_markup: { inline_keyboard: [[
+                { text: '✅ 解封', callback_data: `appeal_unban:${userId}` },
+                { text: '🔁 要求重验', callback_data: `appeal_reverify:${userId}` },
+                { text: '❌ 驳回', callback_data: `appeal_reject:${userId}` }
+            ]] }
+        });
+    }
+    return tgRequest(token, 'sendMessage', { chat_id: userId, text: '📨 你的本地封禁申诉已提交，管理员处理后会通知你。' });
+}
+async function handleLocalAppealCallback(env, query) {
+    const token = env.BOT_TOKEN;
+    const userId = String(query.from.id);
+    const parts = String(query.data || '').split(':');
+    const targetId = String(parts[1] || '');
+    if (!targetId || targetId !== userId) return tgRequest(token, 'answerCallbackQuery', { callback_query_id: query.id, text: '这不是你的申诉入口', show_alert: true });
+    const userData = await getUser(env, userId);
+    if (!userData || !userData.is_banned) return tgRequest(token, 'answerCallbackQuery', { callback_query_id: query.id, text: '你当前未被本地封禁', show_alert: true });
+    const cooldownKey = `appeal_cooldown:${userId}`;
+    if (await env.KV.get(cooldownKey)) return tgRequest(token, 'answerCallbackQuery', { callback_query_id: query.id, text: '申诉已提交，请等待管理员处理', show_alert: true });
+    await env.KV.put(`appeal_reason_pending:${userId}`, JSON.stringify({ from: query.from, created_at: Date.now() }), { expirationTtl: 600 });
+    await tgRequest(token, 'answerCallbackQuery', { callback_query_id: query.id, text: '请发送申诉理由' });
+    return tgRequest(token, 'sendMessage', { chat_id: userId, text: '📨 请直接发送你的申诉理由。\n\n建议写清：为什么被误封、希望管理员如何处理。' });
+}
+
 async function ensureSystemTopic(env, groupId, configName, title) {
     let threadId = await getConfig(env, configName);
     if (threadId) return Number(threadId);
@@ -826,11 +1764,11 @@ async function upsertInboxCard(env, groupId, userId, userData, msg) {
 }
 async function createBlacklistCard(env, userId, reason, appealUrl) {
     const groupId = await getConfig(env, 'group_id');
-    const threadId = await ensureSystemTopic(env, groupId, 'blacklist_thread_id', '🚫 黑名单');
-    if (!groupId || !threadId) return;
+    const threadId = groupId ? await ensureSystemTopic(env, groupId, 'blacklist_thread_id', '🚫 黑名单') : null;
     const userData = await getUser(env, userId) || {};
-    const text = `🚫 <b>黑名单用户</b>\n\n用户：<a href="tg://user?id=${userId}">${formatUserName(userData.user_info)}</a>\nUID：<code>${userId}</code>\n原因：${escapeHtml(reason)}\n申诉：${escapeHtml(appealUrl)}`;
-    const sent = await tgRequest(env.BOT_TOKEN, 'sendMessage', { chat_id: groupId, message_thread_id: threadId, text, parse_mode: 'HTML' });
+    const appealLine = appealUrl ? `\n申诉链接：${escapeHtml(appealUrl)}` : '\n申诉方式：Bot 内本地申诉';
+    const text = `🚫 <b>黑名单用户</b>\n\n用户：<a href="tg://user?id=${userId}">${formatUserName(userData.user_info)}</a>\nUID：<code>${userId}</code>\n原因：${escapeHtml(reason)}${appealLine}`;
+    const sent = groupId && threadId ? await tgRequest(env.BOT_TOKEN, 'sendMessage', { chat_id: groupId, message_thread_id: threadId, text, parse_mode: 'HTML' }) : { ok: false };
     const messageId = sent.ok ? sent.result.message_id : null;
     const db = getD1(env);
     if (db) { await ensureD1Schema(env); await db.prepare('INSERT INTO blacklist (user_id, reason, appeal_url, card_message_id, created_at, lifted_at) VALUES (?, ?, ?, ?, ?, NULL) ON CONFLICT(user_id) DO UPDATE SET reason = excluded.reason, appeal_url = excluded.appeal_url, card_message_id = excluded.card_message_id, lifted_at = NULL').bind(String(userId), reason, appealUrl, messageId, Date.now()).run(); }
@@ -855,6 +1793,33 @@ async function unbanUser(env, userId) {
     }
     if (groupId && cardMessageId) await tgRequest(env.BOT_TOKEN, 'deleteMessage', { chat_id: groupId, message_id: Number(cardMessageId) });
     if (groupId) await upsertProfileCard(env, groupId, userId, userData);
+}
+async function listBlacklist(env, userId = '') {
+    const db = getD1(env);
+    const items = [];
+    if (db) {
+        await ensureD1Schema(env);
+        const result = userId
+            ? await db.prepare('SELECT * FROM blacklist WHERE user_id = ? ORDER BY created_at DESC LIMIT 20').bind(String(userId)).all()
+            : await db.prepare('SELECT * FROM blacklist WHERE lifted_at IS NULL ORDER BY created_at DESC LIMIT 50').all();
+        for (const row of (result.results || [])) {
+            const userData = await getUser(env, row.user_id) || {};
+            items.push({
+                user_id: String(row.user_id),
+                reason: row.reason || '',
+                appeal_url: row.appeal_url || '',
+                created_at: row.created_at || 0,
+                lifted_at: row.lifted_at || null,
+                user: userData.user_info || {}
+            });
+        }
+        return items;
+    }
+    if (userId && env.KV) {
+        const raw = await env.KV.get(`blacklist:${userId}`, { type: 'json' });
+        if (raw) items.push({ user_id: String(userId), ...raw, user: ((await getUser(env, userId)) || {}).user_info || {} });
+    }
+    return items;
 }
 async function clearInboxCard(env, groupId, userId) {
     const db = getD1(env);
@@ -902,25 +1867,69 @@ async function maybeSendRestNotice(env, userId) {
     return true;
 }
 function isProbablyChinese(text) { return /[\u3400-\u9fff]/.test(text || ''); }
-async function maybeTranslateToChinese(env, groupId, threadId, msg) {
+function getAiBinding(env) {
+    return env.AI || env.ai || env.WORKERS_AI || null;
+}
+function extractAiTranslation(response) {
+    if (!response) return '';
+    if (typeof response === 'string') return response;
+    const candidates = [
+        response.response,
+        response.text,
+        response.translation,
+        response.result && response.result.response,
+        response.result && response.result.text,
+        response.result && response.result.translation,
+        response.result
+    ];
+    for (const candidate of candidates) {
+        if (typeof candidate === 'string' && candidate.trim()) return candidate;
+    }
+    return '';
+}
+async function notifyAiTranslateIssue(env, reason) {
+    if (!env.OWNER_ID) return;
+    const key = `ai_translate_notice:${reason}`;
+    if (env.KV && await env.KV.get(key)) return;
+    await tgRequest(env.BOT_TOKEN, 'sendMessage', {
+        chat_id: env.OWNER_ID,
+        text: `⚠️ AI 翻译未生效：${reason}\n\n请检查 Workers AI 绑定名是否为 <code>AI</code>，以及后台 AI 翻译是否开启。`,
+        parse_mode: 'HTML'
+    });
+    if (env.KV) await env.KV.put(key, '1', { expirationTtl: 3600 });
+}
+async function maybeTranslateToChinese(env, targetChatId, threadId, msg) {
     if ((await getConfig(env, 'ai_translate', '0')) !== '1') return;
     const text = getMessageText(msg).trim();
-    if (!text || isProbablyChinese(text) || !env.AI) return;
+    if (!text || isProbablyChinese(text)) return;
+    const ai = getAiBinding(env);
+    if (!ai || typeof ai.run !== 'function') {
+        await notifyAiTranslateIssue(env, '缺少 Workers AI 绑定');
+        return;
+    }
     try {
-        const response = await env.AI.run('@cf/meta/llama-3.1-8b-instruct', {
+        const response = await ai.run('@cf/meta/llama-3.1-8b-instruct', {
             messages: [
                 { role: 'system', content: 'Translate the user message into concise Simplified Chinese. Return only the translation.' },
                 { role: 'user', content: text.slice(0, 3000) }
             ]
         });
-        const translated = (response && (response.response || response.result || response.text)) || '';
-        if (translated.trim()) await tgRequest(env.BOT_TOKEN, 'sendMessage', { chat_id: groupId, message_thread_id: threadId, text: `🌐 <b>中文翻译</b>\n\n${escapeHtml(translated.trim())}`, parse_mode: 'HTML' });
-    } catch (e) {
-        console.error('AI translate failed:', e && e.message);
+        const translated = extractAiTranslation(response);
+        if (translated.trim()) {
+            const payload = { chat_id: targetChatId, text: `🌐 <b>中文翻译</b>\n\n${escapeHtml(translated.trim())}`, parse_mode: 'HTML' };
+            if (threadId) payload.message_thread_id = threadId;
+            await tgRequest(env.BOT_TOKEN, 'sendMessage', payload);
+        } else {
+            await notifyAiTranslateIssue(env, '模型返回为空');
+        }
+    } catch (error) {
+        const message = (error && error.message) || '未知错误';
+        console.error('AI translate failed:', message);
+        await notifyAiTranslateIssue(env, escapeHtml(message).slice(0, 120));
     }
 }
 function buildBusinessExport(configs) {
-    const excluded = new Set(['bot_token', 'owner_id', 'd1', 'db', 'database', 'relaygo_db', 'kv', 'group_id']);
+    const excluded = new Set(['bot_token', 'owner_id', 'd1', 'db', 'database', 'noomichat_db', 'relaygo_db', 'kv', 'group_id']);
     const data = {};
     for (const [key, value] of Object.entries(configs || {})) {
         const normalized = configKey(key).toLowerCase();
@@ -936,7 +1945,7 @@ async function exportBusinessConfig(env) {
         const rows = await db.prepare('SELECT key, value FROM config').all();
         for (const row of (rows.results || [])) configs[row.key] = row.value;
     }
-    const kvKeys = ['union_ban', 'verify_mode', 'verify_captcha_mode', 'verify_question_mode', 'verify_combo_mode', 'verify_custom_question', 'verify_custom_answer', 'verify_fail_limit', 'appeal_url', 'antispam', 'antispam_link', 'antispam_media', 'antispam_keyword', 'antispam_autoban', 'blocked_keywords', 'language', 'auto_reply_msg', 'welcome_msg', 'welcome_button_text', 'welcome_button_url', 'welcome_buttons', 'business_status', 'business_rest_message', 'business_rest_cooldown', 'ai_translate', 'inbox_thread_id', 'blacklist_thread_id'];
+    const kvKeys = ['union_ban', 'verify_mode', 'verify_captcha_mode', 'verify_question_mode', 'verify_combo_mode', 'verify_custom_question', 'verify_custom_answer', 'verify_word_button_answer', 'verify_word_button_choices', 'verify_fail_limit', 'verify_inactive_hours', 'verify_inactive_days', 'verify_image_api_url', 'appeal_url', 'local_appeal_url', 'union_appeal_url', 'antispam', 'antispam_link', 'antispam_media', 'antispam_keyword', 'antispam_autoban', 'blocked_keywords', 'language', 'auto_reply_msg', 'welcome_msg', 'brand_msg', 'welcome_button_text', 'welcome_button_url', 'welcome_buttons', 'welcome_buttons_text', 'business_status', 'business_rest_message', 'business_rest_cooldown', 'ai_translate', 'inbox_thread_id', 'blacklist_thread_id'];
     for (const key of kvKeys) {
         if (configs[key] === undefined) configs[key] = await getConfig(env, key, '');
     }
@@ -949,7 +1958,7 @@ async function importBusinessConfig(env, raw) {
     for (const [key, value] of Object.entries(config)) {
         const normalized = configKey(key);
         const lowerKey = normalized.toLowerCase();
-        if (['bot_token', 'owner_id', 'd1', 'db', 'database', 'relaygo_db', 'kv'].includes(lowerKey) || lowerKey.includes('token') || lowerKey.includes('secret')) continue;
+        if (['bot_token', 'owner_id', 'd1', 'db', 'database', 'noomichat_db', 'relaygo_db', 'kv'].includes(lowerKey) || lowerKey.includes('token') || lowerKey.includes('secret')) continue;
         await setConfig(env, normalized, value);
         count++;
     }
@@ -974,13 +1983,64 @@ async function buildButtonMathChallenge(env, userId) {
     await upsertVerifySession(env, userId, 'button_math', 'pending', parseInt(await env.KV.get(`verify_fail:${userId}`) || '0', 10), 180);
     return { text: `🔒 <b>安全验证</b>\n\n请选择正确答案：${a} + ${b} = ?`, reply_markup: makeChoiceButtons(userId, [...choices]) };
 }
+async function buildEmojiChoiceChallenge(env, userId) {
+    const emojis = ['🐱', '🐶', '🐼', '🦊', '🐸', '🐵', '🐰', '🦁', '🐯', '🐮'];
+    const ans = emojis[randomInt(0, emojis.length - 1)];
+    const choices = new Set([ans]);
+    while (choices.size < 4) choices.add(emojis[randomInt(0, emojis.length - 1)]);
+    await env.KV.put(`verify_pending:${userId}`, JSON.stringify({ type: 'emoji_choice', ans }), { expirationTtl: 180 });
+    await upsertVerifySession(env, userId, 'emoji_choice', 'pending', parseInt(await env.KV.get(`verify_fail:${userId}`) || '0', 10), 180);
+    return {
+        text: `🔒 <b>安全验证</b>\n\n请点击这个表情：<b>${ans}</b>`,
+        reply_markup: { inline_keyboard: [shuffleArray([...choices]).map(v => ({ text: v, callback_data: `verify:${userId}:${encodeURIComponent(v)}` }))] }
+    };
+}
+async function buildWordButtonChallenge(env, userId) {
+    const ans = await getConfig(env, 'verify_word_button_answer', '不是机器人');
+    const wordsRaw = await getConfig(env, 'verify_word_button_choices', '不是机器人,我是机器人,稍后再说,跳过验证');
+    const choices = new Set(String(wordsRaw).split(/[,，\n]/).map(x => x.trim()).filter(Boolean));
+    choices.add(ans);
+    while (choices.size < 4) choices.add(['继续', '通过', '取消', '验证'][choices.size % 4]);
+    await env.KV.put(`verify_pending:${userId}`, JSON.stringify({ type: 'word_button', ans }), { expirationTtl: 180 });
+    await upsertVerifySession(env, userId, 'word_button', 'pending', parseInt(await env.KV.get(`verify_fail:${userId}`) || '0', 10), 180);
+    return {
+        text: `🔒 <b>安全验证</b>\n\n请点击正确按钮：<b>${escapeHtml(ans)}</b>`,
+        reply_markup: { inline_keyboard: [shuffleArray([...choices]).slice(0, 6).map(v => ({ text: v, callback_data: `verify:${userId}:${encodeURIComponent(v)}` }))] }
+    };
+}
 async function buildImageDigitChallenge(env, userId) {
+    const apiUrl = await getConfig(env, 'verify_image_api_url', '');
+    if (apiUrl) {
+        try {
+            const resp = await fetch(apiUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ user_id: String(userId), type: 'digit', ts: Date.now() })
+            });
+            if (resp.ok) {
+                const data = await resp.json();
+                const ans = parseInt(data.answer ?? data.ans ?? data.digit, 10);
+                if (Number.isInteger(ans) && ans >= 0 && ans <= 9 && (data.image_url || data.image || data.image_base64)) {
+                    const choices = new Set(Array.isArray(data.choices) ? data.choices.map(x => parseInt(x, 10)).filter(x => Number.isInteger(x) && x >= 0 && x <= 9) : [ans]);
+                    choices.add(ans);
+                    while (choices.size < 4) choices.add(randomInt(0, 9));
+                    let photo = data.image_url || data.image;
+                    if (data.image_base64) photo = base64ToBlob(data.image_base64, data.mime || 'image/png');
+                    await env.KV.put(`verify_pending:${userId}`, JSON.stringify({ type: 'image_digit', ans }), { expirationTtl: 180 });
+                    await upsertVerifySession(env, userId, 'image_digit_api', 'pending', parseInt(await env.KV.get(`verify_fail:${userId}`) || '0', 10), 180);
+                    return { photo, filename: `noomichat-verify-api-${userId}.png`, caption: data.caption || '🔒 安全验证：请选择图片中的数字', reply_markup: makeChoiceButtons(userId, [...choices].slice(0, 6)) };
+                }
+            }
+        } catch (e) {
+            console.error('verify image api failed:', e && e.message);
+        }
+    }
     const ans = randomInt(0, 9);
     const choices = new Set([ans]);
     while (choices.size < 4) choices.add(randomInt(0, 9));
     await env.KV.put(`verify_pending:${userId}`, JSON.stringify({ type: 'image_digit', ans }), { expirationTtl: 180 });
     await upsertVerifySession(env, userId, 'image_digit', 'pending', parseInt(await env.KV.get(`verify_fail:${userId}`) || '0', 10), 180);
-    return { photo: svgDataUrl(makeDigitSvg(ans)), caption: '🔒 安全验证：请选择图片中的数字', reply_markup: makeChoiceButtons(userId, [...choices]) };
+    return { photo: makeDigitPngBlob(ans), filename: `noomichat-verify-${userId}.png`, caption: '🔒 安全验证：请选择图片中的数字', reply_markup: makeChoiceButtons(userId, [...choices]) };
 }
 async function buildCustomQuestionChallenge(env, userId) {
     const question = await getConfig(env, 'verify_custom_question', '请回复：我不是机器人');
@@ -989,11 +2049,30 @@ async function buildCustomQuestionChallenge(env, userId) {
     await upsertVerifySession(env, userId, 'custom_question', 'pending', parseInt(await env.KV.get(`verify_fail:${userId}`) || '0', 10), 180);
     return { text: `🔒 <b>安全验证</b>\n\n${escapeHtml(question)}\n\n请在 2 分钟内完成验证。` };
 }
+async function rememberVerificationMessage(env, userId, msg) {
+    if (!env.KV || !msg) return;
+    const key = `verify_original:${userId}`;
+    const existing = await env.KV.get(key);
+    if (existing) return;
+    await env.KV.put(key, JSON.stringify(msg), { expirationTtl: 1800 });
+}
+
+async function pullVerificationMessage(env, userId, fallbackMsg) {
+    if (!env.KV) return fallbackMsg;
+    const key = `verify_original:${userId}`;
+    const saved = await env.KV.get(key, { type: 'json' });
+    await env.KV.delete(key);
+    return saved || fallbackMsg;
+}
 async function startQuestionVerification(env, groupId, msg, userId, token, mode) {
     if (mode === 'sticker') {
         await env.KV.put(`verify_pending:${userId}`, JSON.stringify({ type: 'sticker' }), { expirationTtl: 180 });
         await upsertVerifySession(env, userId, 'sticker', 'pending', parseInt(await env.KV.get(`verify_fail:${userId}`) || '0', 10), 180);
-        return tgRequest(token, 'sendMessage', { chat_id: userId, text: "🔒 <b>安全验证</b>\n\n本机器人已开启人机验证，请发送任意 <em>贴纸（Stickers）</em> 以通过验证。\n\n请在 2 分钟内完成验证。", parse_mode: 'HTML' });
+        return tgRequest(token, 'sendMessage', {
+            chat_id: userId,
+            text: "🔒 <b>安全验证</b>\n\n⚫️⚫️⚫️ <b>请发送一张 Telegram 贴纸</b> ⚫️⚫️⚫️\n\n<b>注意：必须是“贴纸 / Sticker”，不是图片、表情、文字。</b>\n\n✅ 发送任意贴纸即可通过验证。\n⏳ 请在 <b>2 分钟</b> 内完成。",
+            parse_mode: 'HTML'
+        });
     } else if (mode === 'math') {
         const a = Math.floor(Math.random() * 10), b = Math.floor(Math.random() * 10);
         await env.KV.put(`verify_pending:${userId}`, JSON.stringify({ type: 'math', ans: a + b }), { expirationTtl: 180 });
@@ -1002,9 +2081,15 @@ async function startQuestionVerification(env, groupId, msg, userId, token, mode)
     } else if (mode === 'button_math') {
         const challenge = await buildButtonMathChallenge(env, userId);
         return tgRequest(token, 'sendMessage', { chat_id: userId, text: challenge.text, parse_mode: 'HTML', reply_markup: challenge.reply_markup });
+    } else if (mode === 'emoji_choice') {
+        const challenge = await buildEmojiChoiceChallenge(env, userId);
+        return tgRequest(token, 'sendMessage', { chat_id: userId, text: challenge.text, parse_mode: 'HTML', reply_markup: challenge.reply_markup });
+    } else if (mode === 'word_button') {
+        const challenge = await buildWordButtonChallenge(env, userId);
+        return tgRequest(token, 'sendMessage', { chat_id: userId, text: challenge.text, parse_mode: 'HTML', reply_markup: challenge.reply_markup });
     } else if (mode === 'image_digit') {
         const challenge = await buildImageDigitChallenge(env, userId);
-        return tgRequest(token, 'sendPhoto', { chat_id: userId, photo: challenge.photo, caption: challenge.caption, reply_markup: challenge.reply_markup });
+        return tgFormRequest(token, 'sendPhoto', { chat_id: userId, photo: challenge.photo, filename: challenge.filename || `noomichat-verify-${userId}.png`, caption: challenge.caption, reply_markup: challenge.reply_markup });
     } else if (mode === 'custom_question') {
         const challenge = await buildCustomQuestionChallenge(env, userId);
         return tgRequest(token, 'sendMessage', { chat_id: userId, text: challenge.text, parse_mode: 'HTML' });
@@ -1019,12 +2104,36 @@ async function completeQuestionVerification(env, groupId, msg, userId, token, pe
     const reverifyPending = await env.KV.get(`reverify_pending:${userId}`, { type: 'json' });
     if (reverifyPending) {
         await env.KV.delete(`reverify_pending:${userId}`);
-        await unbanUser(env, userId);
-        await tgRequest(token, 'sendMessage', { chat_id: userId, text: '✅ 重新验证通过，您可以继续聊天。' });
-        return;
+        if (reverifyPending.reason === 'inactive') {
+            await tgRequest(token, 'sendMessage', { chat_id: userId, text: '✅ 重新验证通过，正在转接您的消息。' });
+            const originalMsg = await pullVerificationMessage(env, userId, msg);
+            return relayVerifiedMessage(env, groupId, originalMsg, userId, token);
+        } else {
+            await unbanUser(env, userId);
+            await tgRequest(token, 'sendMessage', { chat_id: userId, text: '✅ 重新验证通过，您可以继续聊天。' });
+            return;
+        }
     }
-    await tgRequest(token, 'sendMessage', { chat_id: userId, text: "✅ 验证通过，您可以开始聊天了。" });
-    return initializeUser(env, groupId, msg, userId, token);
+    await tgRequest(token, 'sendMessage', { chat_id: userId, text: "✅ 验证通过，正在转接您的消息。" });
+    const originalMsg = await pullVerificationMessage(env, userId, msg);
+    return initializeUser(env, groupId, originalMsg, userId, token, { verifiedJustNow: true });
+}
+async function relayVerifiedMessage(env, groupId, msg, userId, token) {
+    const userData = await getUser(env, userId);
+    if (!userData) return initializeUser(env, groupId, msg, userId, token);
+    await upsertUser(env, { ...userData, user_id: String(userId), is_verified: true, is_banned: false });
+    if (msg.text === '/start') return sendAlreadyVerifiedMessage(env, userId);
+    if (isUserCommandMessage(msg)) return tgRequest(token, 'sendMessage', { chat_id: userId, text: 'ℹ️ 这是机器人指令，不会转发给管理员。请直接发送你要咨询的内容。' });
+    const nextUserData = await syncUserActivity(env, groupId, userId, msg, userData);
+    const targetId = groupId || env.OWNER_ID;
+    if (!targetId) return tgRequest(token, 'sendMessage', { chat_id: userId, text: t(await getLang(env, msg), 'not_bound') });
+    if (!groupId) await sendUserIdentityCard(env, targetId, null, userId, msg.from || {}, '📨 来自用户');
+    const userButton = getUserLinkButton(userId, msg.from || {});
+    const forwarded = await forwardMessage(env, token, targetId, userId, msg, groupId ? nextUserData.thread_id : null, { reply_markup: { inline_keyboard: [[userButton]] } });
+    await sendUserForwardFeedback(env, userId, forwarded && forwarded.ok === false ? `⚠️ 消息发送失败：${forwarded.description || 'Unknown error'}` : '✅ 消息已发送。');
+    if (groupId && nextUserData.thread_id) await maybeTranslateToChinese(env, groupId, nextUserData.thread_id, msg);
+    if (!groupId) await maybeTranslateToChinese(env, targetId, null, msg);
+    return forwarded;
 }
 async function handleReverifyCallback(env, query) {
     const token = env.BOT_TOKEN;
@@ -1039,8 +2148,7 @@ async function handleReverifyCallback(env, query) {
     try { await tgRequest(token, 'editMessageReplyMarkup', { chat_id: query.message.chat.id, message_id: query.message.message_id, reply_markup: { inline_keyboard: [] } }); } catch (e) { }
     await tgRequest(token, 'answerCallbackQuery', { callback_query_id: query.id, text: '请开始重新验证' });
     const settings = await getVerifySettings(env);
-    const unionRaw = await getConfig(env, 'union_ban');
-    const unionEnabled = unionRaw === '1' || unionRaw === 'true';
+    const unionEnabled = await getUnionBanEnabled(env);
     const verifyMsg = { chat: query.message.chat, from: query.from, message_id: query.message.message_id, text: '/start' };
     if (shouldRunCaptcha(settings, unionEnabled)) return startCaptchaVerification(env, groupId, verifyMsg, userId, token, settings, unionEnabled);
     if (shouldRunQuestion(settings)) return handleLocalVerification(env, groupId, verifyMsg, userId, token, settings.questionMode);
@@ -1055,9 +2163,13 @@ async function handleVerifyCallback(env, query) {
     if (parts[1] !== userId) return tgRequest(token, 'answerCallbackQuery', { callback_query_id: query.id, text: '这不是你的验证', show_alert: true });
     const pending = await env.KV.get(`verify_pending:${userId}`, { type: 'json' });
     if (!pending) return tgRequest(token, 'answerCallbackQuery', { callback_query_id: query.id, text: '验证已过期，请发送 /start 重试', show_alert: true });
-    const selected = parseInt(parts[2], 10);
+    const rawSelected = decodeURIComponent(parts.slice(2).join(':') || '');
+    const selected = parseInt(rawSelected, 10);
     const groupId = await getConfig(env, 'group_id');
-    if (selected === pending.ans) {
+    const passed = ['emoji_choice', 'word_button'].includes(pending.type)
+        ? rawSelected === String(pending.ans)
+        : selected === pending.ans;
+    if (passed) {
         await tgRequest(token, 'answerCallbackQuery', { callback_query_id: query.id, text: '验证通过' });
         try { await tgRequest(token, 'editMessageReplyMarkup', { chat_id: query.message.chat.id, message_id: query.message.message_id, reply_markup: { inline_keyboard: [] } }); } catch (e) { }
         return completeQuestionVerification(env, groupId, { chat: query.message.chat, from: query.from, message_id: query.message.message_id, text: '/start' }, userId, token, pending);
@@ -1065,6 +2177,7 @@ async function handleVerifyCallback(env, query) {
     const failCount = await recordVerifyFail(env, userId);
     const limit = await getVerifyFailLimit(env);
     await env.KV.delete(`verify_pending:${userId}`);
+    await env.KV.delete(`verify_original:${userId}`);
     if (failCount >= limit) {
         await tgRequest(token, 'answerCallbackQuery', { callback_query_id: query.id, text: '验证失败，已封禁', show_alert: true });
         return banUserWithNotice(env, userId, `验证失败 ${failCount}/${limit}`);
@@ -1073,9 +2186,8 @@ async function handleVerifyCallback(env, query) {
     return tgRequest(token, 'sendMessage', { chat_id: userId, text: '❌ 验证错误，请发送 /start 重新验证。' });
 }
 
-async function generateSettingsMenu(env) {
-    const unionBanValue = await getConfig(env, 'union_ban');
-    const unionBan = unionBanValue === '1' || unionBanValue === 'true';
+async function generateSettingsMenu(env, page = 'main') {
+    const unionBan = await getUnionBanEnabled(env);
     const verifyMode = await getConfig(env, 'verify_mode', 'off');
     const autoReplyMsg = await getConfig(env, 'auto_reply_msg');
     const botUsername = await getConfig(env, 'bot_username', 'My Bot');
@@ -1084,12 +2196,14 @@ async function generateSettingsMenu(env) {
     const keywordRaw = await getConfig(env, 'blocked_keywords');
     const keywordCount = keywordRaw ? keywordRaw.split(/[\n,，]/).map(x => x.trim()).filter(Boolean).length : 0;
     const failLimit = await getVerifyFailLimit(env);
+    const inactiveHours = await getVerifyInactiveHours(env);
+    const inactiveDisplay = formatInactiveHours(inactiveHours);
     const appealUrl = await getAppealUrl(env);
     const businessStatus = await getConfig(env, 'business_status', 'open');
     const aiTranslate = await getConfig(env, 'ai_translate', '0');
     const unionStatus = unionBan ? '🟢 开启' : '🔴 关闭';
     const verifySettings = await getVerifySettings(env);
-    const verifyLabels = { off: '🔴 关闭', math: '🔢 数学题', button_math: '🔘 算数按钮', sticker: '🎨 贴纸', image_digit: '🖼 图片数字', custom_question: '❓ 自定义问答' };
+    const verifyLabels = { off: '🔴 关闭', math: '🔢 数学题', button_math: '🔘 算数按钮', sticker: '🎨 贴纸', emoji_choice: '😺 表情选择', word_button: '🔤 文字按钮', image_digit: '🖼 图片数字', custom_question: '❓ 自定义问答' };
     const captchaLabels = { off: '🔴 无验证码', cloudflare_turnstile: '🛡 Turnstile', google_recaptcha: '🧩 reCAPTCHA' };
     const comboLabels = { captcha_only: '只验证码', question_only: '只问答', captcha_question: '验证码+问答' };
     const verifyDisplay = `${comboLabels[verifySettings.comboMode] || '只问答'} / ${captchaLabels[verifySettings.captchaMode] || '🔴 无验证码'} / ${verifyLabels[verifySettings.questionMode] || '🔴 关闭'}`;
@@ -1098,20 +2212,61 @@ async function generateSettingsMenu(env) {
     const businessDisplay = businessStatus === 'rest' ? '😴 休息中' : '🟢 营业中';
     const aiDisplay = aiTranslate === '1' ? '🟢 开' : '🔴 关';
     const langDisplay = ({ auto: '🌐 自动', zh: '🇨🇳 中文', en: '🇬🇧 English' })[language] || '🌐 自动';
+    if (page === 'antispam') {
+        return {
+            text: `🛡 <b>防骚扰设置</b>\n\n状态：${antiStatus}\n链接拦截：${anti.blockLinks ? '🟢 开启' : '🔴 关闭'}\n媒体限制：${anti.blockMedia ? '🟢 开启' : '🔴 关闭'}\n关键词：${anti.blockKeywords ? '🟢 开启' : '🔴 关闭'}（${keywordCount} 个）\n命中自封：${anti.autoBan ? '🟢 开启' : '🔴 关闭'}`,
+            reply_markup: { inline_keyboard: [
+                [{ text: `🛡 总开关：${antiStatus}`, callback_data: 'toggle_antispam' }],
+                [{ text: `🔗 链接拦截：${anti.blockLinks ? '🟢' : '🔴'}`, callback_data: 'toggle_antispam_link' }, { text: `🖼 媒体限制：${anti.blockMedia ? '🟢' : '🔴'}`, callback_data: 'toggle_antispam_media' }],
+                [{ text: `🚫 关键词：${anti.blockKeywords ? '🟢' : '🔴'}`, callback_data: 'toggle_antispam_keyword' }, { text: `⚡ 命中自封：${anti.autoBan ? '🟢' : '🔴'}`, callback_data: 'toggle_antispam_autoban' }],
+                [{ text: '📝 关键词管理', callback_data: 'guide_keywords' }],
+                [{ text: '🔙 返回主菜单', callback_data: 'menu_main' }]
+            ] }
+        };
+    }
+    if (page === 'verify') {
+        return {
+            text: `🧩 <b>人机验证</b>\n\n当前：${verifyDisplay}\n失败封禁：${failLimit} 次\n长期未聊重验：${inactiveDisplay}`,
+            reply_markup: { inline_keyboard: [
+                [{ text: `🔗 组合：${comboLabels[verifySettings.comboMode] || '只问答'}`, callback_data: 'cycle_verify_combo' }],
+                [{ text: `🧩 云端验证码：${captchaLabels[verifySettings.captchaMode] || '🔴'}`, callback_data: 'cycle_verify_captcha' }],
+                [{ text: `❓ 本地问答：${verifyLabels[verifySettings.questionMode] || '🔴'}`, callback_data: 'cycle_verify_local' }],
+                [{ text: `❌ 失败封禁：${failLimit}次`, callback_data: 'cycle_verify_fail_limit' }],
+                [{ text: `⏳ 未聊重验：${inactiveDisplay}`, callback_data: 'cycle_verify_inactive' }],
+                [{ text: '🔗 申诉设置', callback_data: 'guide_appeal' }],
+                [{ text: '🔙 返回主菜单', callback_data: 'menu_main' }]
+            ] }
+        };
+    }
+    if (page === 'system') {
+        return {
+            text: `⚙️ <b>系统与配置</b>\n\n联合封禁：${unionStatus}\n语言：${langDisplay}\nAI 翻译：${aiDisplay}`,
+            reply_markup: { inline_keyboard: [
+                [{ text: `🌐 联合封禁：${unionStatus}`, callback_data: 'toggle_union' }],
+                [{ text: `🌐 语言：${langDisplay}`, callback_data: 'cycle_language' }],
+                [{ text: `🤖 AI 翻译：${aiDisplay}`, callback_data: 'toggle_ai_translate' }],
+                [{ text: '📤 导出配置', callback_data: 'export_config' }, { text: '📥 导入说明', callback_data: 'guide_import' }],
+                [{ text: '🔙 返回主菜单', callback_data: 'menu_main' }]
+            ] }
+        };
+    }
+    if (page === 'messages') {
+        return {
+            text: `👋 <b>欢迎与回复设置</b>\n\n自动回复：${replyStatus}\n\n欢迎语、品牌文案、按钮支持在网页后台修改；也可用 /welcome、/brand、/welbtn、/reply 命令。`,
+            reply_markup: { inline_keyboard: [
+                [{ text: '👋 欢迎消息说明', callback_data: 'guide_welcome' }],
+                [{ text: '🤖 自动回复说明', callback_data: 'guide_reply' }],
+                [{ text: '📢 群发广播', callback_data: 'guide_broadcast' }],
+                [{ text: '🔙 返回主菜单', callback_data: 'menu_main' }]
+            ] }
+        };
+    }
     const info = `🛠 <b>${escapeHtml(botUsername)} 管理面板</b>\n\n📊 <b>当前配置:</b>\n🔸 营业状态：${businessDisplay}\n🔸 AI 翻译：${aiDisplay}\n🔸 防骚扰：${antiStatus}\n🔸 链接拦截：${anti.blockLinks ? '🟢 开启' : '🔴 关闭'}\n🔸 媒体限制：${anti.blockMedia ? '🟢 开启' : '🔴 关闭'}\n🔸 关键词：${anti.blockKeywords ? '🟢 开启' : '🔴 关闭'}（${keywordCount} 个）\n🔸 多语言：${langDisplay}\n🔸 联合封禁：${unionStatus}\n🔸 人机验证：${verifyDisplay}\n🔸 失败封禁：${failLimit} 次\n🔸 申诉链接：${escapeHtml(appealUrl)}\n🔸 自动回复：${replyStatus}\n\n👇 点击下方按钮修改设置`;
     const keyboard = { inline_keyboard: [
         [{ text: `🏪 ${businessDisplay}`, callback_data: 'toggle_business' }, { text: `🌐 AI翻译：${aiDisplay}`, callback_data: 'toggle_ai_translate' }],
-        [{ text: `🛡 防骚扰：${antiStatus}`, callback_data: 'toggle_antispam' }],
-        [{ text: `🔗 链接拦截：${anti.blockLinks ? '🟢' : '🔴'}`, callback_data: 'toggle_antispam_link' }, { text: `🖼 媒体限制：${anti.blockMedia ? '🟢' : '🔴'}`, callback_data: 'toggle_antispam_media' }],
-        [{ text: `🚫 关键词：${anti.blockKeywords ? '🟢' : '🔴'}`, callback_data: 'toggle_antispam_keyword' }, { text: `⚡ 命中自封：${anti.autoBan ? '🟢' : '🔴'}`, callback_data: 'toggle_antispam_autoban' }],
-        [{ text: '📝 关键词管理', callback_data: 'guide_keywords' }, { text: `🌐 语言：${langDisplay}`, callback_data: 'cycle_language' }],
-        [{ text: `🌐 联合封禁：${unionStatus}`, callback_data: 'toggle_union' }],
-        [{ text: `🧩 验证码：${captchaLabels[verifySettings.captchaMode] || '🔴'}`, callback_data: 'cycle_verify_captcha' }, { text: `❓ 问答：${verifyLabels[verifySettings.questionMode] || '🔴'}`, callback_data: 'cycle_verify_local' }],
-        [{ text: `🔗 组合：${comboLabels[verifySettings.comboMode] || '只问答'}`, callback_data: 'cycle_verify_combo' }, { text: `❌ 失败封禁：${failLimit}次`, callback_data: 'cycle_verify_fail_limit' }],
-        [{ text: '👮 协管列表', callback_data: 'admin_list' }],
-        [{ text: '🔗 申诉设置', callback_data: 'guide_appeal' }, { text: '👋 欢迎消息', callback_data: 'guide_welcome' }],
-        [{ text: '🤖 自动回复', callback_data: 'guide_reply' }, { text: '📢 广播', callback_data: 'guide_broadcast' }],
-        [{ text: '📤 导出配置', callback_data: 'export_config' }, { text: '📥 导入说明', callback_data: 'guide_import' }],
+        [{ text: '🛡 防骚扰设置 ➡️', callback_data: 'menu_antispam' }, { text: '🧩 人机验证 ➡️', callback_data: 'menu_verify' }],
+        [{ text: '⚙️ 系统与配置 ➡️', callback_data: 'menu_system' }, { text: '👮 协管列表', callback_data: 'admin_list' }],
+        [{ text: '👋 欢迎与回复 ➡️', callback_data: 'menu_messages' }, { text: '📢 群发广播', callback_data: 'guide_broadcast' }],
         [{ text: '🔄 刷新', callback_data: 'refresh_menu' }]
     ] };
     return { text: info, reply_markup: keyboard };
@@ -1122,6 +2277,52 @@ async function handleOwnerCallback(env, query) {
     const data = query.data;
     const chatId = query.message.chat.id;
     const messageId = query.message.message_id;
+
+    if (data.startsWith('identity:')) {
+        const targetId = data.split(':')[1];
+        const userData = await getUser(env, targetId) || {};
+        const info = userData.user_info || {};
+        const username = info.username ? `@${info.username}` : 'None';
+        return tgRequest(token, 'answerCallbackQuery', {
+            callback_query_id: query.id,
+            text: `用户：${getPlainUserName(info)}\nUID：${targetId}\n用户名：${username}`,
+            show_alert: true
+        });
+    }
+
+    if (data.startsWith('menu_') || data === 'refresh_menu') {
+        const page = data === 'refresh_menu' ? 'main' : data.replace('menu_', '');
+        const menu = await generateSettingsMenu(env, page);
+        try { await tgRequest(token, 'editMessageText', { chat_id: chatId, message_id: messageId, text: menu.text, parse_mode: 'HTML', reply_markup: menu.reply_markup }); } catch (e) { }
+        return tgRequest(token, 'answerCallbackQuery', { callback_query_id: query.id });
+    }
+
+    if (data.startsWith('appeal_')) {
+        const [action, targetId] = data.split(':');
+        if (!(await hasPermission(env, query.from.id, 'ban'))) return tgRequest(token, 'answerCallbackQuery', { callback_query_id: query.id, text: '需要 ban 权限', show_alert: true });
+        if (action === 'appeal_unban') {
+            await unbanUser(env, targetId);
+            await env.KV.delete(`appeal_pending:${targetId}`);
+            await writeAuditLog(env, query.from.id, 'appeal.unban', targetId);
+            await tgRequest(token, 'sendMessage', { chat_id: targetId, text: '✅ 你的本地封禁申诉已通过，已为你解除封禁。' });
+            await tgRequest(token, 'answerCallbackQuery', { callback_query_id: query.id, text: '已解封' });
+        } else if (action === 'appeal_reverify') {
+            const userData = await getUser(env, targetId) || { user_id: targetId };
+            await env.KV.put(`reverify_pending:${targetId}`, JSON.stringify({ thread_id: userData.thread_id || null }), { expirationTtl: 1800 });
+            await env.KV.delete(`appeal_pending:${targetId}`);
+            await clearVerifyFail(env, targetId);
+            await writeAuditLog(env, query.from.id, 'appeal.reverify', targetId);
+            await tgRequest(token, 'sendMessage', { chat_id: targetId, text: '🔁 管理员已允许你重新验证。请点击下方按钮开始。', reply_markup: { inline_keyboard: [[{ text: '开始重新验证', callback_data: `reverify:${targetId}` }]] } });
+            await tgRequest(token, 'answerCallbackQuery', { callback_query_id: query.id, text: '已通知用户重验' });
+        } else if (action === 'appeal_reject') {
+            await env.KV.delete(`appeal_pending:${targetId}`);
+            await writeAuditLog(env, query.from.id, 'appeal.reject', targetId);
+            await tgRequest(token, 'sendMessage', { chat_id: targetId, text: '❌ 你的本地封禁申诉已被驳回。' });
+            await tgRequest(token, 'answerCallbackQuery', { callback_query_id: query.id, text: '已驳回' });
+        }
+        try { await tgRequest(token, 'editMessageReplyMarkup', { chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: [] } }); } catch (e) { }
+        return;
+    }
 
     if (data.startsWith('spam_')) {
         const [action, targetId] = data.split(':');
@@ -1152,7 +2353,7 @@ async function handleOwnerCallback(env, query) {
         }
     }
 
-    const configActions = new Set(['toggle_union', 'toggle_business', 'toggle_ai_translate', 'toggle_antispam', 'toggle_antispam_link', 'toggle_antispam_media', 'toggle_antispam_keyword', 'toggle_antispam_autoban', 'cycle_language', 'cycle_verify_fail_limit', 'cycle_verify_captcha', 'cycle_verify_combo', 'cycle_verify_local', 'export_config']);
+    const configActions = new Set(['toggle_union', 'toggle_business', 'toggle_ai_translate', 'toggle_antispam', 'toggle_antispam_link', 'toggle_antispam_media', 'toggle_antispam_keyword', 'toggle_antispam_autoban', 'cycle_language', 'cycle_verify_fail_limit', 'cycle_verify_captcha', 'cycle_verify_combo', 'cycle_verify_local', 'cycle_verify_inactive', 'export_config']);
     if (configActions.has(data) && !(await hasPermission(env, query.from.id, 'config'))) {
         return tgRequest(token, 'answerCallbackQuery', { callback_query_id: query.id, text: '权限不足', show_alert: true });
     }
@@ -1189,7 +2390,7 @@ async function handleOwnerCallback(env, query) {
     else if (data === 'export_config') {
         if (!(await hasPermission(env, query.from.id, 'config'))) return tgRequest(token, 'answerCallbackQuery', { callback_query_id: query.id, text: '权限不足', show_alert: true });
         const exported = await exportBusinessConfig(env);
-        await sendJsonDocument(env, query.from.id, `relaygo-config-${Date.now()}.json`, exported);
+        await sendJsonDocument(env, query.from.id, `noomichat-config-${Date.now()}.json`, exported);
         await writeAuditLog(env, query.from.id, 'config.export');
         return tgRequest(token, 'answerCallbackQuery', { callback_query_id: query.id, text: '已发送导出 JSON' });
     }
@@ -1200,6 +2401,7 @@ async function handleOwnerCallback(env, query) {
     else if (data === 'toggle_antispam_autoban') await setToggle(env, 'config:antispam_autoban');
     else if (data === 'cycle_language') { const modes = ['auto', 'zh', 'en']; const current = await getConfig(env, 'language', 'auto'); await setConfig(env, 'language', modes[(modes.indexOf(current) + 1) % modes.length]); }
     else if (data === 'cycle_verify_fail_limit') { const current = await getVerifyFailLimit(env); const next = current >= 5 ? 1 : current + 1; await setConfig(env, 'verify_fail_limit', String(next)); }
+    else if (data === 'cycle_verify_inactive') { const modes = [0, 1, 2, 6, 12, 24, 72, 168]; const current = await getVerifyInactiveHours(env); const idx = modes.indexOf(current); await setConfig(env, 'verify_inactive_hours', String(modes[(idx + 1) % modes.length])); }
     else if (data === 'cycle_verify_captcha') {
         const modes = ['off', 'cloudflare_turnstile', 'google_recaptcha'];
         const currentMode = await getConfig(env, 'verify_captcha_mode', 'off');
@@ -1211,7 +2413,7 @@ async function handleOwnerCallback(env, query) {
         await setConfig(env, 'verify_combo_mode', modes[(modes.indexOf(currentMode) + 1) % modes.length]);
     }
     else if (data === 'cycle_verify_local') {
-        const modes = ['off', 'math', 'button_math', 'image_digit', 'custom_question'];
+        const modes = ['off', 'math', 'button_math', 'sticker', 'emoji_choice', 'word_button', 'image_digit', 'custom_question'];
         const currentMode = await getConfig(env, 'verify_question_mode', await getConfig(env, 'verify_mode', 'off'));
         const nextMode = modes[(modes.indexOf(currentMode) + 1) % modes.length];
         await setConfig(env, 'verify_question_mode', nextMode);
@@ -1234,9 +2436,11 @@ async function handleOwnerCallback(env, query) {
     else if (data === 'guide_welcome') {
         const current = await getConfig(env, 'welcome_msg');
         const btns = await getConfig(env, 'welcome_buttons');
+        const brand = await getConfig(env, 'brand_msg', DEFAULT_BRAND_MSG);
         const currentText = current ? escapeHtml(current) : "(无)";
+        const brandText = brand ? escapeHtml(brand) : "(已关闭)";
         const btnInfo = btns ? "已设置按钮" : "(无)";
-        const text = `📝 <b>欢迎消息设置</b>\n\n当前文本:\n<pre>${currentText}</pre>\n\n当前按钮: ${btnInfo}\n\n👉 <b>修改文本:</b>\n发送 <code>/welcome</code> {消息内容}\n\n👉 <b>修改按钮:</b>\n发送 <code>/welbtn</code> {按钮内容}\n格式：按钮1 - 链接1 | 按钮2 - 链接2 , 按钮3 - 链接3\n(逗号换行，竖线同行，最多设置3个)\n\n发送 /cancel 返回`;
+        const text = `📝 <b>欢迎消息设置</b>\n\n当前文本:\n<pre>${currentText}</pre>\n\n底部品牌:\n<pre>${brandText}</pre>\n\n当前按钮: ${btnInfo}\n\n👉 <b>修改文本:</b>\n发送 <code>/welcome</code> {消息内容}\n支持 HTML 链接：<code>&lt;a href="https://t.me/xxx"&gt;点击这里&lt;/a&gt;</code>\n\n👉 <b>修改品牌:</b>\n发送 <code>/brand</code> {HTML文案}\n发送 <code>/brand off</code> 关闭\n\n👉 <b>修改按钮:</b>\n发送 <code>/welbtn</code> {按钮内容}\n格式：按钮1 - 链接1 | 按钮2 - 链接2 , 按钮3 - 链接3\n(逗号换行，竖线同行，最多设置3个)\n\n发送 /cancel 返回`;
         await tgRequest(token, 'editMessageText', { chat_id: chatId, message_id: messageId, text: text, parse_mode: 'HTML' });
         return tgRequest(token, 'answerCallbackQuery', { callback_query_id: query.id });
     }
@@ -1258,7 +2462,12 @@ async function handleOwnerCallback(env, query) {
         return tgRequest(token, 'answerCallbackQuery', { callback_query_id: query.id });
     }
 
-    const menu = await generateSettingsMenu(env);
+    let returnPage = 'main';
+    if (data.startsWith('toggle_antispam') || data === 'guide_keywords') returnPage = 'antispam';
+    else if (data.startsWith('cycle_verify') || data === 'guide_appeal') returnPage = 'verify';
+    else if (data === 'toggle_union' || data === 'cycle_language' || data === 'toggle_ai_translate' || data === 'guide_import') returnPage = 'system';
+    else if (data === 'guide_welcome' || data === 'guide_reply' || data === 'guide_broadcast') returnPage = 'messages';
+    const menu = await generateSettingsMenu(env, returnPage);
     try { await tgRequest(token, 'editMessageText', { chat_id: chatId, message_id: messageId, text: menu.text, parse_mode: 'HTML', reply_markup: menu.reply_markup }); } catch (e) { }
     return tgRequest(token, 'answerCallbackQuery', { callback_query_id: query.id });
 }
@@ -1269,12 +2478,28 @@ async function handleOwnerMenu(env, msg, ctx) {
     let text = msg.text || '';
 
     if (text === '/start') {
-        return tgRequest(token, 'sendMessage', { chat_id: chatId, text: `👋 您好，机器人管理员！\n\n您看到此消息说明机器人已成功启动。\n\n当前版本：1.1.6 (Standalone) \n发送 /menu 显示管理菜单`, parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '查看帮助文档', url: 'https://t.me/RelayGo/14' }]] } });
+        return tgRequest(token, 'sendMessage', { chat_id: chatId, text: `👋 您好，NooMiChat 管理员！\n\n您看到此消息说明机器人已成功启动。\n\n当前版本：1.1.23 (Settings Tabs UI)\n项目地址：https://github.com/lijboys/NooMiChat\n发送 /menu 显示管理菜单`, parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '查看项目文档', url: 'https://github.com/lijboys/NooMiChat' }]] } });
     }
 
     if (['/menu', '/cancel'].includes(text)) {
         const menu = await generateSettingsMenu(env);
         return tgRequest(token, 'sendMessage', { chat_id: chatId, text: menu.text, parse_mode: 'HTML', reply_markup: menu.reply_markup });
+    }
+
+    if (msg.reply_to_message && !text.startsWith('/')) {
+        if (!(await hasPermission(env, msg.from.id, 'reply'))) return tgRequest(token, 'sendMessage', { chat_id: chatId, text: '🚫 需要 reply 权限。' });
+        const targetId = await env.KV.get(`owner_reply_map:${msg.reply_to_message.message_id}`);
+        if (targetId) {
+            const result = await forwardMessage(env, token, targetId, chatId, msg);
+            const userData = await getUser(env, targetId) || {};
+            const who = formatUserReplyTarget(targetId, userData);
+            await writeAuditLog(env, msg.from.id, 'message.reply', targetId, { source: 'owner_private' });
+            return tgRequest(token, 'sendMessage', {
+                chat_id: chatId,
+                text: result && result.ok ? `✅ 已回复给：${who}` : `⚠️ 回复可能失败：${who}\n${escapeHtml((result && result.description) || '')}`,
+                parse_mode: 'HTML'
+            });
+        }
     }
 
     if (text === '/admins') {
@@ -1397,7 +2622,7 @@ async function handleOwnerMenu(env, msg, ctx) {
         if (!(await hasPermission(env, msg.from.id, 'config'))) return tgRequest(token, 'sendMessage', { chat_id: chatId, text: '🚫 需要 config 权限。' });
         const exported = await exportBusinessConfig(env);
         await writeAuditLog(env, msg.from.id, 'config.export');
-        return sendJsonDocument(env, chatId, `relaygo-config-${Date.now()}.json`, exported);
+        return sendJsonDocument(env, chatId, `noomichat-config-${Date.now()}.json`, exported);
     }
     if (text.startsWith('/import')) {
         if (!(await hasPermission(env, msg.from.id, 'config'))) return tgRequest(token, 'sendMessage', { chat_id: chatId, text: '🚫 需要 config 权限。' });
@@ -1417,6 +2642,12 @@ async function handleOwnerMenu(env, msg, ctx) {
         await setConfig(env, 'welcome_msg', val);
         return tgRequest(token, 'sendMessage', { chat_id: chatId, text: "✅ 欢迎消息已更新。" });
     }
+    if (text.startsWith('/brand ')) {
+        if (!(await hasPermission(env, msg.from.id, 'config'))) return tgRequest(token, 'sendMessage', { chat_id: chatId, text: '🚫 需要 config 权限。' });
+        const val = text.replace('/brand ', '').trim();
+        await setConfig(env, 'brand_msg', /^off$/i.test(val) ? '' : val);
+        return tgRequest(token, 'sendMessage', { chat_id: chatId, text: /^off$/i.test(val) ? "✅ 底部品牌文案已关闭。" : "✅ 底部品牌文案已更新。" });
+    }
     if (text.startsWith('/verifyqa ')) {
         if (!(await hasPermission(env, msg.from.id, 'config'))) return tgRequest(token, 'sendMessage', { chat_id: chatId, text: '🚫 需要 config 权限。' });
         const raw = text.replace('/verifyqa ', '').trim();
@@ -1434,6 +2665,7 @@ async function handleOwnerMenu(env, msg, ctx) {
         const btns = parseButtons(raw);
         if (!btns) return tgRequest(token, 'sendMessage', { chat_id: chatId, text: "❌ 欢迎按钮格式错误。" });
         await setConfig(env, 'welcome_buttons', JSON.stringify(btns));
+        await setConfig(env, 'welcome_buttons_text', raw);
         return tgRequest(token, 'sendMessage', { chat_id: chatId, text: "✅ 欢迎按钮已更新。" });
     }
     if (text === '/reply') {
@@ -1452,7 +2684,8 @@ async function handleOwnerMenu(env, msg, ctx) {
         if (!(await hasPermission(env, msg.from.id, 'config'))) return tgRequest(token, 'sendMessage', { chat_id: chatId, text: '🚫 需要 config 权限。' });
         const val = text.replace('/appeal ', '').trim();
         await setConfig(env, 'appeal_url', val);
-        return tgRequest(token, 'sendMessage', { chat_id: chatId, text: "✅ 申诉链接已更新。" });
+        await setConfig(env, 'local_appeal_url', val);
+        return tgRequest(token, 'sendMessage', { chat_id: chatId, text: "✅ 本地申诉链接已更新。" });
     }
 
     if (text === '/keywords') {
@@ -1619,7 +2852,7 @@ async function handleGroupMessage(env, msg) {
     await forwardMessage(env, env.BOT_TOKEN, userId, msg.chat.id, msg);
 }
 
-async function handlePrivateOnlyUserMessage(env, msg, userId, userData) {
+async function handlePrivateOnlyUserMessage(env, msg, userId, userData, options = {}) {
     const ownerId = env.OWNER_ID;
     const token = env.BOT_TOKEN;
     const now = Date.now();
@@ -1632,20 +2865,24 @@ async function handlePrivateOnlyUserMessage(env, msg, userId, userData) {
         last_seen: now,
         message_count: ((userData && Number(userData.message_count)) || 0) + (!msg.text || !msg.text.startsWith('/start') ? 1 : 0),
         phone_region: (userData && userData.phone_region) || detectPhoneRegion(getMessageText(msg)),
+        is_verified: true,
         is_banned: false
     };
     await upsertUser(env, next);
-    if (msg.text === '/start') return sendWelcomeMessage(env, userId);
+    if (msg.text === '/start') {
+        if (options.verifiedJustNow) return sendWelcomeMessage(env, userId, { includeBrand: true });
+        return sendAlreadyVerifiedMessage(env, userId);
+    }
+    if (isUserCommandMessage(msg)) return tgRequest(token, 'sendMessage', { chat_id: userId, text: 'ℹ️ 这是机器人指令，不会转发给管理员。请直接发送你要咨询的内容。' });
     if (!ownerId) return tgRequest(token, 'sendMessage', { chat_id: userId, text: t(await getLang(env, msg), 'not_bound') });
-    const name = formatUserName(info);
-    const username = info.username ? `@${escapeHtml(info.username)}` : 'None';
-    await tgRequest(token, 'sendMessage', {
-        chat_id: ownerId,
-        text: `📩 <b>新私聊消息</b>\n\n用户：<a href="tg://user?id=${userId}">${name}</a>\nUID：<code>${userId}</code>\n用户名：${username}`,
-        parse_mode: 'HTML'
-    });
-    await forwardMessage(env, token, ownerId, userId, msg);
-    return tgRequest(token, 'sendMessage', { chat_id: userId, text: '✅ 已收到您的消息，管理员会尽快回复。' });
+    if (options.verifiedJustNow) await sendWelcomeMessage(env, userId, { includeBrand: true });
+    await sendUserIdentityCard(env, ownerId, null, userId, info, '📩 新私聊消息');
+    const userButton = getUserLinkButton(userId, info);
+    const forwarded = await forwardMessage(env, token, ownerId, userId, msg, null, { reply_markup: { inline_keyboard: [[userButton]] } });
+    if (forwarded && !forwarded.ok) return tgRequest(token, 'sendMessage', { chat_id: userId, text: `⚠️ 消息发送失败：${forwarded.description || 'Unknown error'}` });
+    await sendUserForwardFeedback(env, userId);
+    await maybeTranslateToChinese(env, ownerId, null, msg);
+    return forwarded;
 }
 
 // 用户私聊核心逻辑
@@ -1660,8 +2897,7 @@ async function handleUserPrivateMessage(env, groupId, msg) {
     // 验证码刷新入口必须早于本地封禁检查，封禁用户重验也要能回跳。
     if (msg.text && msg.text.startsWith('/start refresh_')) {
         const refreshSettings = await getVerifySettings(env);
-        const unionRaw = await getConfig(env, 'union_ban');
-        const unionEnabled = unionRaw === '1' || unionRaw === 'true';
+        const unionEnabled = await getUnionBanEnabled(env);
         if (shouldRunCaptcha(refreshSettings, unionEnabled)) return handleUnionRefresh(env, groupId, msg, userId, token);
     }
 
@@ -1673,24 +2909,24 @@ async function handleUserPrivateMessage(env, groupId, msg) {
 
     // 本地封禁检查
     if (userData && userData.is_banned) {
-        const appealUrl = await getAppealUrl(env);
+        const appealUrl = await getLocalAppealUrl(env);
         if (msg.text === '/start') await createBlacklistCard(env, userId, '已封禁用户重新进入', appealUrl);
         await upsertVerifySession(env, userId, 'banned_reentry', 'appeal_or_reverify', 0, 3600);
+        if (await env.KV.get(`appeal_reason_pending:${userId}`) && msg.text && !msg.text.startsWith('/')) {
+            return submitLocalAppeal(env, userId, msg.from, msg.text);
+        }
+        const keyboard = [[{ text: '📨 本地申诉（填写理由）', callback_data: `appeal:${userId}` }], [{ text: '🔁 重新验证', callback_data: `reverify:${userId}` }]];
+        if (appealUrl) keyboard.push([{ text: '🔗 本地申诉链接', url: appealUrl }]);
         return tgRequest(token, 'sendMessage', {
             chat_id: userId,
-            text: `${t(lang, 'banned')}\n\n请选择重新验证或通过申诉链接联系管理员：${appealUrl}`,
+            text: `${t(lang, 'banned')}\n\n你可以点击下方按钮提交本地申诉，申诉时需要填写理由。`,
             parse_mode: 'HTML',
-            reply_markup: { inline_keyboard: [[{ text: '🔁 重新验证', callback_data: `reverify:${userId}` }, { text: '📨 申诉', url: appealUrl }]] },
+            reply_markup: { inline_keyboard: keyboard },
         });
     }
 
     // 2. 读取联合封禁配置（内存缓存 → KV）
-    let isUnionBanEnabled = memGet('config:union_ban');
-    if (isUnionBanEnabled === undefined) {
-        const raw = await getConfig(env, 'union_ban');
-        isUnionBanEnabled = raw === '1' || raw === 'true';
-        memSet('config:union_ban', isUnionBanEnabled);
-    }
+    let isUnionBanEnabled = await getUnionBanEnabled(env);
 
     // 3. 联合封禁检查（内存缓存 → KV 缓存 → 远程 API）
     if (isUnionBanEnabled) {
@@ -1706,7 +2942,14 @@ async function handleUserPrivateMessage(env, groupId, msg) {
             memSet(gbanKey, gbanStatus);
         }
         if (gbanStatus === "true") {
-            return tgRequest(token, 'sendMessage', { chat_id: userId, text: t(lang, 'union_banned'), parse_mode: 'HTML' });
+            const unionAppealUrl = await getUnionAppealUrl(env);
+            return tgRequest(token, 'sendMessage', {
+                chat_id: userId,
+                text: `🚫 <b>您已被联合封禁。</b>\n这是外部联合封禁服务，不是 NooMiChat 本地黑名单。\n\n如需申诉，请使用联合封禁申诉入口。`,
+                parse_mode: 'HTML',
+                disable_web_page_preview: true,
+                reply_markup: { inline_keyboard: [[{ text: '🔗 联合封禁申诉', url: unionAppealUrl }]] }
+            });
         }
     }
 
@@ -1715,19 +2958,29 @@ async function handleUserPrivateMessage(env, groupId, msg) {
         return handleUnionRefresh(env, groupId, msg, userId, token);
     }
 
-    // 已验证用户
-    const spamCheck = await checkAntiSpam(env, groupId, msg, userData);
-    if (!spamCheck.ok) {
-        return tgRequest(token, 'sendMessage', { chat_id: userId, text: t(lang, spamCheck.messageKey), parse_mode: 'HTML' });
+    const verifySettings = await getVerifySettings(env);
+    if (userData && (userData.thread_id || userData.is_verified) && await shouldReverifyInactive(env, userData, verifySettings, isUnionBanEnabled)) {
+        await rememberVerificationMessage(env, userId, msg);
+        await env.KV.put(`reverify_pending:${userId}`, JSON.stringify({ thread_id: userData.thread_id || null, reason: 'inactive', last_seen: userData.last_seen || 0 }), { expirationTtl: 1800 });
+        await upsertVerifySession(env, userId, 'inactive_reverify', 'started', 0, 600);
+        await tgRequest(token, 'sendMessage', { chat_id: userId, text: `🔒 你已经超过 ${formatInactiveHours(await getVerifyInactiveHours(env))} 未发送消息，需要重新验证后再继续。` });
+        if (shouldRunCaptcha(verifySettings, isUnionBanEnabled)) return startCaptchaVerification(env, groupId, msg, userId, token, verifySettings, isUnionBanEnabled);
+        return handleLocalVerification(env, groupId, msg, userId, token, verifySettings.questionMode);
     }
 
-    if (userData && userData.thread_id) {
-        if (msg.text === '/start') return sendWelcomeMessage(env, userId);
+    // 已验证用户：支持有群 Topic，也支持无群直接转发给主人
+    const isVerified = userData && (userData.thread_id || userData.is_verified);
+    if (isVerified) {
+        if (groupId && !userData.thread_id) return initializeUser(env, groupId, msg, userId, token);
+        if (msg.text === '/start') return sendAlreadyVerifiedMessage(env, userId);
+        if (isUserCommandMessage(msg)) return tgRequest(token, 'sendMessage', { chat_id: userId, text: 'ℹ️ 这是机器人指令，不会转发给管理员。请直接发送你要咨询的内容。' });
+
+        const spamCheck = await checkAntiSpam(env, groupId, msg, userData);
+        if (!spamCheck.ok) return tgRequest(token, 'sendMessage', { chat_id: userId, text: t(lang, spamCheck.messageKey), parse_mode: 'HTML' });
 
         const nextUserData = await syncUserActivity(env, groupId, userId, msg, userData);
         if (await maybeSendRestNotice(env, userId)) return;
 
-        // 自动回复（媒体组只触发一次，内存缓存 → KV）
         if (!msg.media_group_id) {
             let autoReplyMsg = memGet('config:auto_reply_msg');
             if (autoReplyMsg === undefined) {
@@ -1742,13 +2995,18 @@ async function handleUserPrivateMessage(env, groupId, msg) {
                 }
             }
         }
-        const forwarded = await forwardMessage(env, token, groupId, userId, msg, nextUserData.thread_id);
-        await maybeTranslateToChinese(env, groupId, nextUserData.thread_id, msg);
+
+        const targetId = groupId || env.OWNER_ID;
+        if (!targetId) return tgRequest(token, 'sendMessage', { chat_id: userId, text: t(lang, 'not_bound') });
+        if (!groupId) await sendUserIdentityCard(env, targetId, null, userId, msg.from || {}, '📨 来自用户');
+        const userButton = getUserLinkButton(userId, msg.from || {});
+        const forwarded = await forwardMessage(env, token, targetId, userId, msg, groupId ? nextUserData.thread_id : null, { reply_markup: { inline_keyboard: [[userButton]] } });
+        await sendUserForwardFeedback(env, userId, forwarded && forwarded.ok === false ? `⚠️ 消息发送失败：${forwarded.description || 'Unknown error'}` : '✅ 消息已发送。');
+        if (groupId && nextUserData.thread_id) await maybeTranslateToChinese(env, groupId, nextUserData.thread_id, msg);
+        if (!groupId) await maybeTranslateToChinese(env, targetId, null, msg);
         return forwarded;
     }
-
     // 新用户验证：支持验证码、问答、验证码+问答组合
-    const verifySettings = await getVerifySettings(env);
     const captchaPassedKey = `verify_captcha_passed:${userId}`;
     const captchaPassed = env.KV ? await env.KV.get(captchaPassedKey) : null;
     if (shouldRunQuestion(verifySettings) && (!shouldRunCaptcha(verifySettings, isUnionBanEnabled) || captchaPassed === '1')) {
@@ -1769,20 +3027,16 @@ async function handleUserPrivateMessage(env, groupId, msg) {
 async function startCaptchaVerification(env, groupId, msg, userId, token, verifySettings, isUnionBanEnabled) {
     const botUsername = memGet('config:bot_username') || await getConfig(env, 'bot_username', 'Bot');
     memSet('config:bot_username', botUsername);
-    const payloadObj = { uid: userId, bot: botUsername, ts: Date.now(), provider: isUnionBanEnabled ? 'cloudflare_turnstile' : verifySettings.captchaMode, combo: verifySettings.comboMode };
+    const payloadObj = { uid: userId, bot: botUsername, ts: Date.now(), provider: verifySettings.captchaMode, combo: verifySettings.comboMode };
     const payload = btoa(JSON.stringify(payloadObj)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
     const webAppUrl = `https://t.me/${CENTRAL_BOT_USERNAME}/${CENTRAL_WEBAPP_NAME}?startapp=${payload}`;
-    const providerName = isUnionBanEnabled || verifySettings.captchaMode === 'cloudflare_turnstile' ? 'Cloudflare Turnstile' : 'Google reCAPTCHA';
+    const providerName = verifySettings.captchaMode === 'cloudflare_turnstile' ? 'Cloudflare Turnstile' : 'Google reCAPTCHA';
+    const questionTip = shouldRunQuestion(verifySettings) ? '\n\n完成验证码后还需要继续回答本地问题。' : '';
+    await rememberVerificationMessage(env, userId, msg);
     await upsertVerifySession(env, userId, verifySettings.captchaMode || 'captcha', 'pending', parseInt(await env.KV.get(`verify_fail:${userId}`) || '0', 10), 600);
     return tgRequest(token, 'sendMessage', {
         chat_id: userId,
-        text: `🔒 <b>安全验证</b>
-
-本机器人已开启 ${providerName} 验证，请点击下方按钮验证身份。${shouldRunQuestion(verifySettings) ? '
-
-完成验证码后还需要继续回答本地问题。' : ''}
-
-请在 10 分钟内完成验证并返回。`,
+        text: `🔒 <b>安全验证</b>\n\n本机器人已开启 ${providerName} 验证，请点击下方按钮验证身份。${questionTip}\n\n请在 10 分钟内完成验证并返回。`,
         parse_mode: 'HTML',
         reply_markup: { inline_keyboard: [[{ text: "👉 点击验证 (Click to Verify)", url: webAppUrl }]] }
     });
@@ -1809,11 +3063,17 @@ async function handleUnionRefresh(env, groupId, msg, userId, token) {
         const reverifyPending = await env.KV.get(`reverify_pending:${userId}`, { type: 'json' });
         if (reverifyPending) {
             await env.KV.delete(`reverify_pending:${userId}`);
+            if (reverifyPending.reason === 'inactive') {
+                await tgRequest(token, 'sendMessage', { chat_id: userId, text: "✅ 重新验证通过，正在转接您的消息。" });
+                const originalMsg = await pullVerificationMessage(env, userId, msg);
+                return relayVerifiedMessage(env, groupId, originalMsg, userId, token);
+            }
             await unbanUser(env, userId);
             return tgRequest(token, 'sendMessage', { chat_id: userId, text: "✅ 重新验证通过，您可以继续聊天。" });
         }
-        await tgRequest(token, 'sendMessage', { chat_id: userId, text: "✅ 验证通过，您可以开始聊天了。" });
-        return initializeUser(env, groupId, msg, userId, token);
+        await tgRequest(token, 'sendMessage', { chat_id: userId, text: "✅ 验证通过，正在转接您的消息。" });
+        const originalMsg = await pullVerificationMessage(env, userId, msg);
+        return initializeUser(env, groupId, originalMsg, userId, token, { verifiedJustNow: true });
     } else {
         let debugText = "❌ 验证状态已过期。请发送 /start 重新验证。";
         if (checkRes.debug_info) {
@@ -1827,7 +3087,8 @@ async function handleLocalVerification(env, groupId, msg, userId, token, mode) {
     const tempKey = `verify_pending:${userId}`;
     const pendingState = await env.KV.get(tempKey, { type: 'json' });
 
-    if (!pendingState && msg.text === '/start') {
+    if (!pendingState) {
+        await rememberVerificationMessage(env, userId, msg);
         return startQuestionVerification(env, groupId, msg, userId, token, mode);
     }
 
@@ -1842,6 +3103,7 @@ async function handleLocalVerification(env, groupId, msg, userId, token, mode) {
             return completeQuestionVerification(env, groupId, msg, userId, token, pendingState);
         } else {
             await env.KV.delete(tempKey);
+            await env.KV.delete(`verify_original:${userId}`);
             const failCount = await recordVerifyFail(env, userId);
             const limit = await getVerifyFailLimit(env);
             if (failCount >= limit) return banUserWithNotice(env, userId, `验证失败 ${failCount}/${limit}`);
@@ -1850,8 +3112,8 @@ async function handleLocalVerification(env, groupId, msg, userId, token, mode) {
     }
 }
 
-async function initializeUser(env, groupId, msg, userId, token) {
-    if (!groupId) return handlePrivateOnlyUserMessage(env, msg, userId, await getUser(env, userId));
+async function initializeUser(env, groupId, msg, userId, token, options = {}) {
+    if (!groupId) return handlePrivateOnlyUserMessage(env, msg, userId, await getUser(env, userId), options);
 
     try {
         // 创建 Topic
@@ -1869,6 +3131,7 @@ async function initializeUser(env, groupId, msg, userId, token) {
         const userData = {
             user_id: String(userId),
             thread_id: threadId,
+            is_verified: true,
             is_banned: false,
             user_info: msg.from,
             first_seen: Date.now(),
@@ -1897,25 +3160,18 @@ async function initializeUser(env, groupId, msg, userId, token) {
 
         await tgRequest(token, 'sendMessage', { chat_id: groupId, message_thread_id: threadId, text: infoMsg, parse_mode: 'HTML' });
         await upsertProfileCard(env, groupId, userId, userData);
-        await sendWelcomeMessage(env, userId);
+        await sendWelcomeMessage(env, userId, { includeBrand: !!options.verifiedJustNow });
 
-        if (!msg.text || !msg.text.startsWith('/start')) {
+        if (isUserCommandMessage(msg)) {
+            await tgRequest(token, 'sendMessage', { chat_id: userId, text: 'ℹ️ 这是机器人指令，不会转发给管理员。请直接发送你要咨询的内容。' });
+        } else if (!msg.text || !msg.text.startsWith('/start')) {
             await upsertInboxCard(env, groupId, userId, userData, msg);
-            await forwardMessage(env, token, groupId, userId, msg, threadId);
+            const userButton = getUserLinkButton(userId, msg.from || {});
+            await forwardMessage(env, token, groupId, userId, msg, threadId, { reply_markup: { inline_keyboard: [[userButton]] } });
             await maybeTranslateToChinese(env, groupId, threadId, msg);
+            await sendUserForwardFeedback(env, userId);
         }
     } catch (e) {
         return tgRequest(token, 'sendMessage', { chat_id: userId, text: "Error: " + e.message });
     }
 }
-
-
-
-
-
-
-
-
-
-
-
