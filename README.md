@@ -2,9 +2,9 @@
 
 # NooMiChat
 
-**基于 Cloudflare Workers 的 Telegram 私聊中继 / 客服 / 协管机器人**
+**基于 Cloudflare Workers 的 Telegram 双向私聊 bot**
 
-NooMiChat 是基于 RelayGo 开源项目二次开发的 Telegram 私聊中继系统。它可以把用户私聊转发到 Telegram 群组 Topic，支持协管权限、D1 数据库、验证系统、CRM 资料卡、黑名单隔离、聚合收件箱、网页后台和 AI 翻译。
+NooMiChat 是基于 RelayGo 开源项目二次开发的 Telegram 双向私聊 bot。它可以把用户私聊转发到管理员私聊或 Telegram 群组 Topic，支持协管权限、D1 数据库、验证系统、CRM 资料卡、黑名单隔离、聚合收件箱、网页后台和 AI 翻译。
 
 [项目地址：lijboys/NooMiChat](https://github.com/lijboys/NooMiChat)
 
@@ -13,7 +13,7 @@ NooMiChat 是基于 RelayGo 开源项目二次开发的 Telegram 私聊中继系
 [![D1](https://img.shields.io/badge/Database-D1-orange)](https://developers.cloudflare.com/d1/)
 [![KV](https://img.shields.io/badge/Storage-KV-blue)](https://developers.cloudflare.com/kv/)
 [![Workers AI](https://img.shields.io/badge/AI-Workers%20AI-purple)](https://developers.cloudflare.com/workers-ai/)
-[![Version](https://img.shields.io/badge/version-2.1.3-blueviolet)](#)
+[![Version](https://img.shields.io/badge/version-2.1.4-blueviolet)](#)
 
 </div>
 
@@ -223,7 +223,7 @@ https://api.telegram.org/bot你的BOT_TOKEN/getWebhookInfo
 
 ## 🧵 绑定 Telegram 群组
 
-完整客服中继模式需要一个 Telegram 群组。
+完整 Topic 双向私聊模式需要一个 Telegram 群组。
 
 ### 群组要求
 
@@ -259,7 +259,7 @@ https://api.telegram.org/bot你的BOT_TOKEN/getWebhookInfo
 - 不会创建用户 Topic。
 - CRM 资料卡、收件箱 Topic、黑名单 Topic 等群组能力不可用。
 
-要获得完整客服后台体验，建议绑定开启 Topics 的群组。
+要获得完整双向私聊后台体验，建议绑定开启 Topics 的群组。
 
 ## 🔑 权限系统
 
@@ -542,6 +542,6 @@ D1 表是自动初始化的，但需要触发 Worker。
 
 <div align="center">
 
-**NooMiChat — 基于 RelayGo 二次开发，用 Cloudflare Workers 搭建轻量、可控、免服务器的 Telegram 客服中继系统。**
+**NooMiChat — 基于 RelayGo 二次开发，用 Cloudflare Workers 搭建轻量、可控、免服务器的 Telegram双向私聊bot。**
 
 </div>
