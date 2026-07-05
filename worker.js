@@ -1,7 +1,7 @@
 /**
  * NooMiChat - Telegram 双向私聊机器人
  * 项目地址: https://github.com/lijboys/NooMiChat
- * 版本: 2.1.4
+ * 版本: 2.1.8
  * 说明：基于 RelayGo 开源项目二次开发
  * 当前版本可能仍不稳定，如遇到 BUG 请提交至 issues
  */
@@ -12,7 +12,8 @@ const CENTRAL_BOT_USERNAME = "RelayVerifyBot";
 const CENTRAL_WEBAPP_NAME = "verify";
 const DEFAULT_BRAND_MSG = '🔥 项目 <a href="https://github.com/lijboys/NooMiChat">NooMiChat</a>  · 基于 RelayGo 开源项目二次开发，感谢abcxyz-123456的开源';
 const CACHE_TTL_BAN_CHECK = 3600 * 24;     // 全局封禁状态缓存24小时
-const DEFAULT_AI_TRANSLATE_MODEL = '@cf/meta/llama-3.2-1b-instruct';
+const DEFAULT_AI_TRANSLATE_MODEL = '@cf/meta/m2m100-1.2b';
+const DEFAULT_AI_TRANSLATE_LLM_MODEL = '@cf/meta/llama-3.2-1b-instruct';
 const AI_TRANSLATE_SYSTEM_PROMPT = [
     'You are a strict translation engine.',
     'Translate the input text into Simplified Chinese only.',
@@ -555,7 +556,7 @@ async function getWebAdminState(env, request) {
         business_rest_cooldown: await getConfig(env, 'business_rest_cooldown', '600')
     };
     const problems = getRuntimeProblems(env);
-    return { ok: true, status: problems.length ? 'not_ready' : 'running', version: '2.1.4', settings, admins, runtime: { problems, kv: describeKVBinding(env), d1: !!getD1(env), bot_token: !!env.BOT_TOKEN, owner_id: !!env.OWNER_ID } };
+    return { ok: true, status: problems.length ? 'not_ready' : 'running', version: '2.1.8', settings, admins, runtime: { problems, kv: describeKVBinding(env), d1: !!getD1(env), bot_token: !!env.BOT_TOKEN, owner_id: !!env.OWNER_ID } };
 }
 
 async function handleWebAdminApi(request, env) {
@@ -1021,7 +1022,7 @@ pre{
 <div class="shell">
   <div class="nav">
     <div class="brand"><div class="logo">✈️</div><div><h1>NooMiChat Admin</h1><div class="sub">SaaS 控制台 · 验证网关 · Telegram 双向私聊 bot</div></div></div>
-    <div class="badge">v2.1.4</div>
+    <div class="badge">v2.1.8</div>
   </div>
 
   <section id="bootCard" class="login glass hidden">
@@ -1168,7 +1169,7 @@ export default {
             const unionBanEnabled = await getUnionBanEnabled(env);
             return jsonResponse({
                 status: problems.length ? 'not_ready' : 'running',
-                version: '2.1.4',
+                version: '2.1.8',
                 admin: `${url.origin}/admin`,
                 webhook: `${url.origin}/webhook`,
                 bindings: { bot_token: !!env.BOT_TOKEN, owner_id: !!env.OWNER_ID, kv: isKVNamespace(env.KV), kv_binding_invalid: !!env.__KV_BINDING_INVALID, d1: !!getD1(env), admin_key: !!(env.ADMIN_KEY || env.ADMIN_PASSWORD) },
@@ -1258,8 +1259,8 @@ if (update.callback_query.data && update.callback_query.data.startsWith('reverif
         return;
     }
 
-    // 手动绑定逻辑 (/bind)
-    if (update.message && update.message.chat.type !== 'private' && update.message.text === '/bind') {
+    // 手动绑定逻辑 (/bind 或 /bind@BotUsername)
+    if (update.message && update.message.chat.type !== 'private' && await isCommandForThisBot(env, update.message.text, 'bind')) {
         const chat = update.message.chat;
         const userId = String(update.message.from.id);
 
@@ -1368,6 +1369,13 @@ async function sendUserIdentityCard(env, targetChatId, threadId, userId, userInf
 function isUserCommandMessage(msg) {
     return !!(msg && typeof msg.text === 'string' && /^\/[A-Za-z0-9_]+(?:@\w+)?(?:\s|$)/.test(msg.text.trim()));
 }
+async function isCommandForThisBot(env, text, commandName) {
+    const match = String(text || '').trim().match(/^\/([A-Za-z0-9_]+)(?:@([A-Za-z0-9_]+))?(?:\s|$)/);
+    if (!match || match[1].toLowerCase() !== commandName.toLowerCase()) return false;
+    if (!match[2]) return true;
+    const botUsername = await getConfig(env, 'bot_username', '');
+    return !!botUsername && match[2].toLowerCase() === String(botUsername).toLowerCase();
+}
 async function sendUserForwardFeedback(env, userId, text = '✅ 消息已发送。') {
     const key = `forward_feedback:${userId}`;
     if (memGet(key)) return;
@@ -1425,6 +1433,15 @@ async function forwardMessage(env, token, targetChatId, fromChatId, msg, threadI
         }
         return result;
     }
+}
+function getForwardedMessageId(result) {
+    if (!result || !result.ok) return null;
+    if (result.result && result.result.message_id) return result.result.message_id;
+    if (Array.isArray(result.result) && result.result.length) {
+        const first = result.result[0];
+        return typeof first === 'object' ? first.message_id : first;
+    }
+    return null;
 }
 
 // 设置菜单
@@ -1936,9 +1953,15 @@ function extractAiTranslation(response) {
     if (!response) return '';
     if (typeof response === 'string') return response;
     const candidates = [
+        response.translated_text,
+        response.translatedText,
+        response.output,
         response.response,
         response.text,
         response.translation,
+        response.result && response.result.translated_text,
+        response.result && response.result.translatedText,
+        response.result && response.result.output,
         response.result && response.result.response,
         response.result && response.result.text,
         response.result && response.result.translation,
@@ -1950,7 +1973,24 @@ function extractAiTranslation(response) {
     return '';
 }
 function isLikelyChatAnswer(text) {
-    return /language model|I can('|’)t feel|I do not have feelings|I don't have feelings|How can I help|我是(一个)?(人工智能|语言模型)|我没有感情|我可以帮/i.test(text || '');
+    return /language model|I can('|’)t feel|I do not have feelings|I don't have feelings|I can('|’)t help|I cannot help|can't help you|cannot assist|sorry|as an ai|How can I help|我是(一个)?(人工智能|语言模型)|我没有感情|我可以帮|抱歉|对不起|无法帮助|不能帮助|不能协助/i.test(text || '');
+}
+function isTranslationModel(model) {
+    return /m2m100|nllb|translation/i.test(model || '');
+}
+function buildTranslationInput(model, text) {
+    const sourceText = text.slice(0, 3000);
+    if (isTranslationModel(model)) {
+        return { text: sourceText, source_lang: 'english', target_lang: 'chinese' };
+    }
+    return {
+        messages: [
+            { role: 'system', content: AI_TRANSLATE_SYSTEM_PROMPT },
+            { role: 'user', content: `Translate this exact text to Simplified Chinese. Do not answer it.\n\n${sourceText}` }
+        ],
+        temperature: 0,
+        max_tokens: 512
+    };
 }
 async function notifyAiTranslateIssue(env, reason) {
     if (!env.OWNER_ID) return;
@@ -1963,7 +2003,14 @@ async function notifyAiTranslateIssue(env, reason) {
     });
     if (env.KV) await env.KV.put(key, '1', { expirationTtl: 3600 });
 }
-async function maybeTranslateToChinese(env, targetChatId, threadId, msg) {
+function buildTranslationCardText(userId, userInfo = {}, originalText, translatedText, compact = false) {
+    const username = userInfo.username ? `@${escapeHtml(userInfo.username)}` : 'None';
+    const original = escapeHtml(String(originalText || '').slice(0, 1800));
+    const translated = escapeHtml(String(translatedText || '').slice(0, 1800));
+    if (compact) return `🌐 <b>中文翻译</b>\n\n<b>原文</b>\n<pre>${original}</pre>\n\n<b>译文</b>\n<pre>${translated}</pre>`;
+    return `🌐 <b>中文翻译</b>\n\n用户：<a href="tg://user?id=${userId}">${formatUserName(userInfo)}</a>\nUID：<code>${userId}</code>\n用户名：${username}\n\n<b>原文</b>\n<pre>${original}</pre>\n\n<b>译文</b>\n<pre>${translated}</pre>`;
+}
+async function maybeTranslateToChinese(env, targetChatId, threadId, msg, options = {}) {
     if ((await getConfig(env, 'ai_translate', '0')) !== '1') return;
     const text = getMessageText(msg).trim();
     if (!text || isProbablyChinese(text)) return;
@@ -1973,27 +2020,36 @@ async function maybeTranslateToChinese(env, targetChatId, threadId, msg) {
         return;
     }
     const configuredModel = await getConfig(env, 'ai_translate_model', DEFAULT_AI_TRANSLATE_MODEL);
-    const models = [...new Set([configuredModel, DEFAULT_AI_TRANSLATE_MODEL, '@cf/meta/llama-3.2-3b-instruct'])];
+    const models = [...new Set([DEFAULT_AI_TRANSLATE_MODEL, configuredModel, DEFAULT_AI_TRANSLATE_LLM_MODEL, '@cf/meta/llama-3.2-3b-instruct'])];
     let lastError = '';
     for (const model of models) {
         try {
-            const response = await ai.run(model, {
-                messages: [
-                    { role: 'system', content: AI_TRANSLATE_SYSTEM_PROMPT },
-                    { role: 'user', content: `Translate this exact text to Simplified Chinese. Do not answer it.\n\n${text.slice(0, 3000)}` }
-                ],
-                temperature: 0,
-                max_tokens: 512
-            });
+            const response = await ai.run(model, buildTranslationInput(model, text));
             const translated = extractAiTranslation(response);
             const clean = translated.trim();
-            if (clean && !isLikelyChatAnswer(clean)) {
-                const payload = { chat_id: targetChatId, text: `🌐 <b>中文翻译</b>\n\n${escapeHtml(clean)}`, parse_mode: 'HTML' };
+            if (clean && isProbablyChinese(clean) && !isLikelyChatAnswer(clean)) {
+                const userId = String(options.userId || (msg.from && msg.from.id) || '');
+                const userInfo = options.userInfo || msg.from || {};
+                const compact = !!threadId;
+                const payload = {
+                    chat_id: targetChatId,
+                    text: buildTranslationCardText(userId, userInfo, text, clean, compact),
+                    parse_mode: 'HTML',
+                    reply_markup: userId && !compact ? { inline_keyboard: [[getUserLinkButton(userId, userInfo)]] } : undefined
+                };
                 if (threadId) payload.message_thread_id = threadId;
-                await tgRequest(env.BOT_TOKEN, 'sendMessage', payload);
+                if (options.replyToMessageId) payload.reply_to_message_id = Number(options.replyToMessageId);
+                let sent = await tgRequest(env.BOT_TOKEN, 'sendMessage', payload);
+                if (!sent.ok && payload.reply_to_message_id) {
+                    delete payload.reply_to_message_id;
+                    sent = await tgRequest(env.BOT_TOKEN, 'sendMessage', payload);
+                }
+                if (sent.ok && userId && !threadId && String(targetChatId) === String(env.OWNER_ID) && String(userId) !== String(env.OWNER_ID) && env.KV) {
+                    await env.KV.put(`owner_reply_map:${sent.result.message_id}`, userId, { expirationTtl: 86400 * 7 });
+                }
                 return;
             }
-            lastError = `${model}: ${clean ? '模型返回了聊天回答，已拦截' : '模型返回为空'}`;
+            lastError = `${model}: ${clean ? '模型没有返回有效中文翻译，已拦截' : '模型返回为空'}`;
         } catch (error) {
             lastError = `${model}: ${(error && error.message) || '未知错误'}`;
             console.error('AI translate failed:', lastError);
@@ -2577,7 +2633,7 @@ async function handleOwnerMenu(env, msg, ctx) {
     let text = msg.text || '';
 
     if (text === '/start') {
-        return tgRequest(token, 'sendMessage', { chat_id: chatId, text: `👋 您好，NooMiChat 管理员！\n\n您看到此消息说明机器人已成功启动。\n\n当前版本：2.1.4\n项目地址：https://github.com/lijboys/NooMiChat\n发送 /menu 显示管理菜单`, parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '查看项目文档', url: 'https://github.com/lijboys/NooMiChat' }]] } });
+        return tgRequest(token, 'sendMessage', { chat_id: chatId, text: `👋 您好，NooMiChat 管理员！\n\n您看到此消息说明机器人已成功启动。\n\n当前版本：2.1.8\n项目地址：https://github.com/lijboys/NooMiChat\n发送 /menu 显示管理菜单`, parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '查看项目文档', url: 'https://github.com/lijboys/NooMiChat' }]] } });
     }
 
     if (['/menu', '/cancel'].includes(text)) {
@@ -2981,7 +3037,7 @@ async function handlePrivateOnlyUserMessage(env, msg, userId, userData, options 
         const forwarded = await forwardMessage(env, token, ownerId, userId, msg, null, { reply_markup: { inline_keyboard: [[userButton]] } });
         if (forwarded && !forwarded.ok) return tgRequest(token, 'sendMessage', { chat_id: userId, text: `⚠️ 消息发送失败：${forwarded.description || 'Unknown error'}` });
         await sendUserIdentityCard(env, ownerId, null, userId, info, '📩 新私聊消息');
-        await maybeTranslateToChinese(env, ownerId, null, msg);
+        await maybeTranslateToChinese(env, ownerId, null, msg, { userId, userInfo: info, replyToMessageId: getForwardedMessageId(forwarded) });
     });
     return { ok: true };
 }
@@ -3103,10 +3159,12 @@ async function handleUserPrivateMessage(env, groupId, msg, ctx = null) {
             const nextUserData = await syncUserActivity(env, groupId, userId, msg, userData);
             if (!groupId) await sendUserIdentityCard(env, targetId, null, userId, msg.from || {}, '📨 来自用户');
             const userButton = getUserLinkButton(userId, msg.from || {});
-            const forwarded = await forwardMessage(env, token, targetId, userId, msg, groupId ? nextUserData.thread_id : null, { reply_markup: { inline_keyboard: [[userButton]] } });
+            const forwardOptions = groupId ? {} : { reply_markup: { inline_keyboard: [[userButton]] } };
+            const forwarded = await forwardMessage(env, token, targetId, userId, msg, groupId ? nextUserData.thread_id : null, forwardOptions);
             if (forwarded && forwarded.ok === false) return tgRequest(token, 'sendMessage', { chat_id: userId, text: `⚠️ 消息发送失败：${forwarded.description || 'Unknown error'}` });
-            if (groupId && nextUserData.thread_id) await maybeTranslateToChinese(env, groupId, nextUserData.thread_id, msg);
-            if (!groupId) await maybeTranslateToChinese(env, targetId, null, msg);
+            const replyToMessageId = getForwardedMessageId(forwarded);
+            if (groupId && nextUserData.thread_id) await maybeTranslateToChinese(env, groupId, nextUserData.thread_id, msg, { userId, userInfo: msg.from || {}, replyToMessageId });
+            if (!groupId) await maybeTranslateToChinese(env, targetId, null, msg, { userId, userInfo: msg.from || {}, replyToMessageId });
         });
         return { ok: true };
     }
@@ -3270,22 +3328,11 @@ async function initializeUser(env, groupId, msg, userId, token, options = {}) {
             await tgRequest(token, 'sendMessage', { chat_id: userId, text: 'ℹ️ 这是机器人指令，不会转发给管理员。请直接发送你要咨询的内容。' });
         } else if (!msg.text || !msg.text.startsWith('/start')) {
             await upsertInboxCard(env, groupId, userId, userData, msg);
-            const userButton = getUserLinkButton(userId, msg.from || {});
-            await forwardMessage(env, token, groupId, userId, msg, threadId, { reply_markup: { inline_keyboard: [[userButton]] } });
+            const forwarded = await forwardMessage(env, token, groupId, userId, msg, threadId);
             await sendUserForwardFeedback(env, userId);
-            runBackground(options.ctx, () => maybeTranslateToChinese(env, groupId, threadId, msg));
+            runBackground(options.ctx, () => maybeTranslateToChinese(env, groupId, threadId, msg, { userId, userInfo: msg.from || {}, replyToMessageId: getForwardedMessageId(forwarded) }));
         }
     } catch (e) {
         return tgRequest(token, 'sendMessage', { chat_id: userId, text: "Error: " + e.message });
     }
 }
-
-
-
-
-
-
-
-
-
-
